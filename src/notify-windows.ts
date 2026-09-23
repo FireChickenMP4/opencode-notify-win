@@ -13,6 +13,7 @@
  *   OPENCODE_NOTIFY_APPID        AUMID to send as
  */
 
+import { spawn } from "node:child_process";
 import { appendFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,34 +50,84 @@ const debug = process.env.OPENCODE_NOTIFY_DEBUG === "1";
 const SCRIPT = SCRIPT_CANDIDATES.find((p) => existsSync(p)) ?? SCRIPT_CANDIDATES[0]!;
 
 /**
- * Send one toast.
+ * De-duplicate notifications of the same kind within a short window.
  *
- * Uses a synchronous spawn on purpose. The previous fire-and-forget version
- * used `detached: true` + `stdio: "ignore"` + `unref()`, and on Windows the
- * child was torn down before PowerShell could run - the log said "sending" but
- * nothing appeared. A synchronous call is deterministic and, since PowerShell
- * startup is a few hundred ms, cheap enough for a notification.
+ * A single "turn finished" can fire several idle signals (session.status idle
+ * and session.idle, sometimes twice in the same second, and an ESC interrupt
+ * produces a burst). Without this, one end-of-turn becomes four toasts.
  */
-function toast(title: string, message: string, overrideScenario?: string): void {
-  if (!enabled || process.platform !== "win32") return;
-  try {
-    const result = Bun.spawnSync([PS, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT], {
-      env: {
-        ...process.env,
-        NOTIFY_TITLE: title,
-        NOTIFY_MSG: message.slice(0, 400),
-        NOTIFY_SCENARIO: overrideScenario ?? scenario,
-        NOTIFY_SOUND: sound ? "1" : "0",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-      timeout: 8000,
-    });
-    const err = result.stderr?.toString().trim();
-    traceEvent(`toast: exit=${result.exitCode}${err ? ` stderr=${err.slice(0, 200)}` : ""}`);
-  } catch (cause) {
-    traceEvent(`toast: threw ${cause instanceof Error ? cause.message : String(cause)}`);
+const DEDUP_MS = Number(process.env.OPENCODE_NOTIFY_DEDUP_MS ?? 3000);
+const lastSent = new Map<string, number>();
+
+function shouldSend(kind: string): boolean {
+  const now = Date.now();
+  const prev = lastSent.get(kind) ?? 0;
+  if (now - prev < DEDUP_MS) {
+    traceEvent(`toast: suppressed duplicate ${kind} (within ${DEDUP_MS}ms)`);
+    return false;
   }
+  lastSent.set(kind, now);
+  return true;
+}
+
+/**
+ * Send one toast, awaiting the PowerShell process.
+ *
+ * Two earlier approaches both failed inside opencode:
+ *   - detached + stdio:"ignore" + unref(): the child was reaped before
+ *     PowerShell ran (Windows), so the log said "sending" but nothing appeared.
+ *   - Bun.spawnSync: intermittently returned exitCode=null within ~3ms, i.e.
+ *     the spawn was aborted before starting. Blocking the event loop inside
+ *     opencode's runtime is not reliable.
+ *
+ * This version spawns asynchronously (not detached, pipes drained) and awaits
+ * exit. It is deterministic and does not block the event loop.
+ */
+function sendToast(title: string, message: string, overrideScenario?: string): Promise<void> {
+  if (!enabled || process.platform !== "win32") return Promise.resolve();
+
+  return new Promise<void>((resolve) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(PS, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT], {
+        env: {
+          ...process.env,
+          NOTIFY_TITLE: title,
+          NOTIFY_MSG: message.slice(0, 400),
+          NOTIFY_SCENARIO: overrideScenario ?? scenario,
+          NOTIFY_SOUND: sound ? "1" : "0",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch (cause) {
+      traceEvent(`toast: spawn threw ${cause instanceof Error ? cause.message : String(cause)}`);
+      resolve();
+      return;
+    }
+
+    let out = "";
+    child.stdout?.on("data", (d) => (out += d.toString()));
+    child.stderr?.on("data", (d) => (out += d.toString()));
+
+    const timer = setTimeout(() => {
+      child.kill();
+      traceEvent("toast: timed out after 8s (killed)");
+      resolve();
+    }, 8000);
+
+    child.on("error", (cause) => {
+      clearTimeout(timer);
+      traceEvent(`toast: error ${cause.message}`);
+      resolve();
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const err = out.trim();
+      traceEvent(`toast: exit=${code}${err ? ` out=${err.slice(0, 200)}` : ""}`);
+      resolve();
+    });
+  });
 }
 
 export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
@@ -141,28 +192,41 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
         const status = (event as { properties?: { status?: { type?: string } } }).properties?.status;
         if (status?.type === "idle") {
           if (!notifyOnIdle) return;
+          if (!shouldSend("idle")) return;
           traceEvent("toast: status idle -> sending");
-          toast(`${projectLabel} · 完成`, "agent 已结束，可以查看了");
+          await sendToast(`${projectLabel} · 完成`, "agent 已结束，可以查看了");
         }
         return;
       }
 
       if (type === "session.idle") {
         if (!notifyOnIdle) return;
+        if (!shouldSend("idle")) return;
         traceEvent("toast: idle -> sending");
-        toast(`${projectLabel} · 完成`, "agent 已结束，可以查看了");
+        await sendToast(`${projectLabel} · 完成`, "agent 已结束，可以查看了");
         return;
       }
 
       if (type === "permission.asked" || type === "permission.updated") {
+        if (!shouldSend("permission")) return;
         traceEvent("toast: permission -> sending");
-        toast(`${projectLabel} · 需要授权`, "agent 正在等待你的权限确认", "urgent");
+        await sendToast(`${projectLabel} · 需要授权`, "agent 正在等待你的权限确认", "urgent");
+        return;
+      }
+
+      // The agent asked the user a question (the `question` tool). This is the
+      // "needs a decision" case and must reach the user reliably.
+      if (type === "question.asked") {
+        if (!shouldSend("question")) return;
+        traceEvent("toast: question -> sending");
+        await sendToast(`${projectLabel} · 需要你回答`, "agent 提了一个问题，等待你的决定", "urgent");
         return;
       }
 
       if (type === "session.error") {
+        if (!shouldSend("error")) return;
         traceEvent("toast: error -> sending");
-        toast(`${projectLabel} · 出错`, "会话发生错误，请检查", "urgent");
+        await sendToast(`${projectLabel} · 出错`, "会话发生错误，请检查", "urgent");
         return;
       }
     },

@@ -61,7 +61,12 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 |---|---|
 | 会话空闲（`session.status` 且 `status.type === "idle"`） | `{项目名} · 完成` |
 | 权限请求（`permission.asked`） | `{项目名} · 需要授权` |
+| agent 提问（`question.asked`） | `{项目名} · 需要你回答` |
 | 会话出错（`session.error`） | `{项目名} · 出错` |
+
+> **去抖**：一次"回合结束"可能连发多个空闲信号（`session.status` idle 与
+> `session.idle`，ESC 打断时甚至一秒内数条）。同类通知在 `OPENCODE_NOTIFY_DEDUP_MS`
+> （默认 3000ms）内只发一次，避免刷屏。
 
 > **注意**：opencode V2 实际**不发出** `session.idle` 事件，空闲是通过
 > `session.status` 携带 `status.type === "idle"` 表达的。插件两者都监听，以兼容
@@ -69,11 +74,15 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ### 发送方式
 
-Toast 用 **同步 spawn**（`Bun.spawnSync`）发送，不用 fire-and-forget。
+Toast 用**异步 spawn 并 await 退出**发送（不 detached）。
 
-早期版本用 `detached: true` + `stdio: "ignore"` + `unref()`，在 Windows 上子进程会在
-PowerShell 真正执行前被回收——日志显示已发送，但屏幕毫无动静。同步调用是确定性的，
-PowerShell 启动几百毫秒，对通知来说完全可接受。
+先后试过两种都失败在 opencode 进程内：
+- `detached: true` + `stdio: "ignore"` + `unref()`：子进程在 PowerShell 执行前被
+  回收，日志显示已发送但屏幕无反应。
+- `Bun.spawnSync`：会偶发返回 `exitCode=null`（约 3ms 内被中断），阻塞事件循环
+  在这个运行时里不可靠。
+
+异步 spawn（非 detached、排空管道）是确定性的，也不阻塞事件循环。
 
 ## 配置
 
