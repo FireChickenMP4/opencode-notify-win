@@ -74,15 +74,19 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ### 发送方式
 
-Toast 用**异步 spawn 并 await 退出**发送（不 detached）。
+Toast 用**异步 spawn 并 await 退出**发送（不 detached），且**串行排队 + 失败重试一次**。
 
-先后试过两种都失败在 opencode 进程内：
-- `detached: true` + `stdio: "ignore"` + `unref()`：子进程在 PowerShell 执行前被
-  回收，日志显示已发送但屏幕无反应。
-- `Bun.spawnSync`：会偶发返回 `exitCode=null`（约 3ms 内被中断），阻塞事件循环
-  在这个运行时里不可靠。
+踩过的三种失败：
+- `detached: true` + `stdio: "ignore"` + `unref()`：子进程在 PowerShell 执行前被回收，
+  日志显示已发送但屏幕无反应。
+- `Bun.spawnSync`：偶发返回 `exitCode=null`（约 3ms 内被中断）。
+- **并发**：opencode 不 await 事件处理器，多个事件同时触发会让两个 PowerShell 同时启动，
+  同样产生 `exit=null`。改为串行队列后消除。
 
-异步 spawn（非 detached、排空管道）是确定性的，也不阻塞事件循环。
+### ESC 打断
+
+ESC 中断会发 `session.error`，但 `error.name === "MessageAbortedError"`。
+这是用户主动打断，不是故障，插件会跳过，不报"出错"。
 
 ## 配置
 

@@ -71,22 +71,38 @@ function shouldSend(kind: string): boolean {
 }
 
 /**
- * Send one toast, awaiting the PowerShell process.
+ * Toast sending is serialised through a queue.
  *
- * Two earlier approaches both failed inside opencode:
- *   - detached + stdio:"ignore" + unref(): the child was reaped before
- *     PowerShell ran (Windows), so the log said "sending" but nothing appeared.
- *   - Bun.spawnSync: intermittently returned exitCode=null within ~3ms, i.e.
- *     the spawn was aborted before starting. Blocking the event loop inside
- *     opencode's runtime is not reliable.
- *
- * This version spawns asynchronously (not detached, pipes drained) and awaits
- * exit. It is deterministic and does not block the event loop.
+ * opencode does not await event handlers, so several `event` invocations can
+ * run concurrently. Two PowerShell processes starting at once produced
+ * intermittent `exit=null` (the spawn aborted within a few ms). Running one at
+ * a time removes the race; a failed attempt is retried once.
  */
-function sendToast(title: string, message: string, overrideScenario?: string): Promise<void> {
-  if (!enabled || process.platform !== "win32") return Promise.resolve();
+let queue: Promise<void> = Promise.resolve();
 
-  return new Promise<void>((resolve) => {
+function sendToast(title: string, message: string, overrideScenario?: string): Promise<void> {
+  const next = queue.then(() => attemptToast(title, message, overrideScenario));
+  // Keep the chain alive even if a link rejects.
+  queue = next.catch(() => {});
+  return next;
+}
+
+async function attemptToast(title: string, message: string, overrideScenario?: string): Promise<void> {
+  if (!enabled || process.platform !== "win32") return;
+  for (let i = 1; i <= 2; i++) {
+    const code = await runPowerShellToast(title, message, overrideScenario, i);
+    if (code === 0) return;
+    traceEvent(`toast: attempt ${i} failed (exit=${code})`);
+  }
+}
+
+function runPowerShellToast(
+  title: string,
+  message: string,
+  overrideScenario: string | undefined,
+  attempt: number,
+): Promise<number | null> {
+  return new Promise<number | null>((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(PS, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT], {
@@ -102,7 +118,7 @@ function sendToast(title: string, message: string, overrideScenario?: string): P
       });
     } catch (cause) {
       traceEvent(`toast: spawn threw ${cause instanceof Error ? cause.message : String(cause)}`);
-      resolve();
+      resolve(null);
       return;
     }
 
@@ -113,19 +129,19 @@ function sendToast(title: string, message: string, overrideScenario?: string): P
     const timer = setTimeout(() => {
       child.kill();
       traceEvent("toast: timed out after 8s (killed)");
-      resolve();
+      resolve(null);
     }, 8000);
 
     child.on("error", (cause) => {
       clearTimeout(timer);
       traceEvent(`toast: error ${cause.message}`);
-      resolve();
+      resolve(null);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      const err = out.trim();
-      traceEvent(`toast: exit=${code}${err ? ` out=${err.slice(0, 200)}` : ""}`);
-      resolve();
+      const extra = out.trim();
+      traceEvent(`toast: exit=${code}${extra ? ` out=${extra.slice(0, 200)}` : ""}${attempt > 1 ? " (retry)" : ""}`);
+      resolve(code);
     });
   });
 }
@@ -224,8 +240,16 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
       }
 
       if (type === "session.error") {
+        // An ESC interrupt arrives as session.error with name
+        // "MessageAbortedError". That is a deliberate user action, not a
+        // failure, so it must not raise an "error" notification.
+        const errName = (event as { properties?: { error?: { name?: string } } }).properties?.error?.name;
+        if (errName === "MessageAbortedError") {
+          traceEvent("toast: skipped (user aborted)");
+          return;
+        }
         if (!shouldSend("error")) return;
-        traceEvent("toast: error -> sending");
+        traceEvent(`toast: error -> sending (${errName ?? "unknown"})`);
         await sendToast(`${projectLabel} · 出错`, "会话发生错误，请检查", "urgent");
         return;
       }
