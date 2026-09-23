@@ -1,5 +1,7 @@
 # opencode-notify-win
 
+> 我顺手 vibe 的
+
 Windows 原生 Toast 通知，给 [opencode](https://opencode.ai) 用。
 
 ## 为什么需要它
