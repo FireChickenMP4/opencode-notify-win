@@ -59,9 +59,21 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 | 事件 | 通知 |
 |---|---|
-| 会话完成（`session.idle`） | `{项目名} · 完成` |
+| 会话空闲（`session.status` 且 `status.type === "idle"`） | `{项目名} · 完成` |
 | 权限请求（`permission.asked`） | `{项目名} · 需要授权` |
 | 会话出错（`session.error`） | `{项目名} · 出错` |
+
+> **注意**：opencode V2 实际**不发出** `session.idle` 事件，空闲是通过
+> `session.status` 携带 `status.type === "idle"` 表达的。插件两者都监听，以兼容
+> 不同版本。这也是早期"任务完成不弹窗"的根因。
+
+### 发送方式
+
+Toast 用 **同步 spawn**（`Bun.spawnSync`）发送，不用 fire-and-forget。
+
+早期版本用 `detached: true` + `stdio: "ignore"` + `unref()`，在 Windows 上子进程会在
+PowerShell 真正执行前被回收——日志显示已发送，但屏幕毫无动静。同步调用是确定性的，
+PowerShell 启动几百毫秒，对通知来说完全可接受。
 
 ## 配置
 

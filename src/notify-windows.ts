@@ -13,13 +13,26 @@
  *   OPENCODE_NOTIFY_APPID        AUMID to send as
  */
 
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "@opencode-ai/plugin";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Diagnostics: append every event to a file. opencode's own log does not record
+ * event dispatch, so this is how you tell "hook never fired" from "fired but
+ * the toast was suppressed". Disable with OPENCODE_NOTIFY_LOG=0.
+ */
+function traceEvent(line: string): void {
+  if (process.env.OPENCODE_NOTIFY_LOG === "0") return;
+  try {
+    appendFileSync(join(HERE, "notify-windows.events.log"), `${new Date().toISOString()} ${line}\n`, "utf8");
+  } catch {
+    /* diagnostics must never break anything */
+  }
+}
 // Installed layout: <plugins>/notify-windows.ts + <plugins>/notify/notify.ps1
 // Repo layout:      <repo>/src/notify-windows.ts + <repo>/src/notify.ps1
 const SCRIPT_CANDIDATES = [join(HERE, "notify", "notify.ps1"), join(HERE, "notify.ps1")];
@@ -31,14 +44,23 @@ const enabled = process.env.OPENCODE_NOTIFY !== "0";
 const scenario = process.env.OPENCODE_NOTIFY_SCENARIO ?? "urgent";
 const sound = process.env.OPENCODE_NOTIFY_SOUND !== "0";
 const notifyOnIdle = process.env.OPENCODE_NOTIFY_ON_IDLE !== "0";
+const debug = process.env.OPENCODE_NOTIFY_DEBUG === "1";
 
 const SCRIPT = SCRIPT_CANDIDATES.find((p) => existsSync(p)) ?? SCRIPT_CANDIDATES[0]!;
 
-/** Send one toast. Fire-and-forget; a failure must never break a session. */
+/**
+ * Send one toast.
+ *
+ * Uses a synchronous spawn on purpose. The previous fire-and-forget version
+ * used `detached: true` + `stdio: "ignore"` + `unref()`, and on Windows the
+ * child was torn down before PowerShell could run - the log said "sending" but
+ * nothing appeared. A synchronous call is deterministic and, since PowerShell
+ * startup is a few hundred ms, cheap enough for a notification.
+ */
 function toast(title: string, message: string, overrideScenario?: string): void {
   if (!enabled || process.platform !== "win32") return;
   try {
-    const child = spawn(PS, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT], {
+    const result = Bun.spawnSync([PS, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT], {
       env: {
         ...process.env,
         NOTIFY_TITLE: title,
@@ -46,14 +68,14 @@ function toast(title: string, message: string, overrideScenario?: string): void 
         NOTIFY_SCENARIO: overrideScenario ?? scenario,
         NOTIFY_SOUND: sound ? "1" : "0",
       },
-      stdio: "ignore",
+      stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
-      detached: true,
+      timeout: 8000,
     });
-    child.on("error", () => {});
-    child.unref();
-  } catch {
-    /* never throw from a notification path */
+    const err = result.stderr?.toString().trim();
+    traceEvent(`toast: exit=${result.exitCode}${err ? ` stderr=${err.slice(0, 200)}` : ""}`);
+  } catch (cause) {
+    traceEvent(`toast: threw ${cause instanceof Error ? cause.message : String(cause)}`);
   }
 }
 
@@ -95,18 +117,51 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
     event: async ({ event }) => {
       const type = event.type;
 
+      // Diagnostics: set OPENCODE_NOTIFY_DEBUG=1 to log every event, which is
+      // how you tell "hook not called" from "wrong event name".
+      if (debug) {
+        await client.app
+          .log({
+            body: {
+              service: "notify-windows",
+              level: "info",
+              message: `event: ${type}`,
+              extra: { payload: JSON.stringify(event).slice(0, 300) },
+            },
+          })
+          .catch(() => {});
+      }
+
+      traceEvent(`event:${type}`);
+
+      // V2 signals "session is now idle" via session.status with status.type
+      // === "idle". The standalone session.idle event is not emitted in
+      // practice, which is why an idle-only hook never fired.
+      if (type === "session.status") {
+        const status = (event as { properties?: { status?: { type?: string } } }).properties?.status;
+        if (status?.type === "idle") {
+          if (!notifyOnIdle) return;
+          traceEvent("toast: status idle -> sending");
+          toast(`${projectLabel} · 完成`, "agent 已结束，可以查看了");
+        }
+        return;
+      }
+
       if (type === "session.idle") {
         if (!notifyOnIdle) return;
+        traceEvent("toast: idle -> sending");
         toast(`${projectLabel} · 完成`, "agent 已结束，可以查看了");
         return;
       }
 
-      if (type === "permission.asked") {
+      if (type === "permission.asked" || type === "permission.updated") {
+        traceEvent("toast: permission -> sending");
         toast(`${projectLabel} · 需要授权`, "agent 正在等待你的权限确认", "urgent");
         return;
       }
 
       if (type === "session.error") {
+        traceEvent("toast: error -> sending");
         toast(`${projectLabel} · 出错`, "会话发生错误，请检查", "urgent");
         return;
       }
