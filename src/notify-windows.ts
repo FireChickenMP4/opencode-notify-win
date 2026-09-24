@@ -10,11 +10,14 @@
  *   OPENCODE_NOTIFY_SCENARIO     default | urgent | alarm | reminder
  *   OPENCODE_NOTIFY_SOUND=0      no sound
  *   OPENCODE_NOTIFY_ON_IDLE=0    skip "session idle" (notify only on question/permission/error)
+ *   OPENCODE_NOTIFY_SUBAGENT=1   also notify when a subagent finishes (default off)
+ *   OPENCODE_NOTIFY_LOG=0        disable the diagnostics event log
+ *   OPENCODE_NOTIFY_LOG_MAX      rotate the diagnostics log past this many bytes
  *   OPENCODE_NOTIFY_APPID        AUMID to send as
  */
 
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync } from "node:fs";
+import { appendFileSync, existsSync, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "@opencode-ai/plugin";
@@ -22,14 +25,35 @@ import type { Plugin } from "@opencode-ai/plugin";
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 /**
- * Diagnostics: append every event to a file. opencode's own log does not record
- * event dispatch, so this is how you tell "hook never fired" from "fired but
- * the toast was suppressed". Disable with OPENCODE_NOTIFY_LOG=0.
+ * Cap for the diagnostics log. It is rotated to `.1` (one previous generation)
+ * once it grows past this, so a long-lived session cannot fill the disk.
+ */
+const LOG_MAX_BYTES = Number(process.env.OPENCODE_NOTIFY_LOG_MAX ?? 5 * 1024 * 1024);
+
+/** Amortise the size check: a syscall per streamed delta would be wasteful. */
+let logWrites = 0;
+
+/**
+ * Diagnostics: record the events this plugin acts on, plus internal
+ * skip/send decisions. opencode's own log does not record event dispatch, so
+ * this is how you tell "hook never fired" from "fired but the toast was
+ * suppressed". High-frequency streaming events are excluded on purpose - the
+ * full event dump is available with OPENCODE_NOTIFY_DEBUG=1. Disable with
+ * OPENCODE_NOTIFY_LOG=0.
  */
 function traceEvent(line: string): void {
   if (process.env.OPENCODE_NOTIFY_LOG === "0") return;
+  const path = join(HERE, "notify-windows.events.log");
   try {
-    appendFileSync(join(HERE, "notify-windows.events.log"), `${new Date().toISOString()} ${line}\n`, "utf8");
+    if (++logWrites % 256 === 0 && statSync(path).size > LOG_MAX_BYTES) {
+      // Bun on Windows replaces an existing target, so no pre-delete needed.
+      renameSync(path, `${path}.1`);
+    }
+  } catch {
+    /* size check is best-effort; never break the event path */
+  }
+  try {
+    appendFileSync(path, `${new Date().toISOString()} ${line}\n`, "utf8");
   } catch {
     /* diagnostics must never break anything */
   }
@@ -52,6 +76,16 @@ const clickToActivate = process.env.OPENCODE_NOTIFY_CLICK_ACTIVATE === "1";
 const flashWindow = process.env.OPENCODE_NOTIFY_FLASH !== "0";
 
 const SCRIPT = SCRIPT_CANDIDATES.find((p) => existsSync(p)) ?? SCRIPT_CANDIDATES[0]!;
+
+/** Event types the plugin acts on; only these go into the diagnostics log. */
+const TRACED_EVENTS = new Set([
+  "session.status",
+  "session.idle",
+  "permission.asked",
+  "permission.updated",
+  "question.asked",
+  "session.error",
+]);
 
 /**
  * De-duplicate notifications of the same kind within a short window.
@@ -257,11 +291,14 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
           .catch(() => {});
       }
 
-      traceEvent(`event:${type}`);
+      // Only trace events this plugin acts on. Streaming deltas
+      // (message.part.delta) fire per token and once accounted for a 40MB log;
+      // the full event dump is available behind OPENCODE_NOTIFY_DEBUG=1.
+      if (TRACED_EVENTS.has(type)) traceEvent(`event:${type}`);
 
-      // V2 signals "session is now idle" via session.status with status.type
-      // === "idle". The standalone session.idle event is not emitted in
-      // practice, which is why an idle-only hook never fired.
+      // Both session.status/idle and the standalone session.idle carry the
+      // sessionID; whichever fires, the subagent check must run so a subagent
+      // finishing is not reported as the main turn ending.
       if (type === "session.status") {
         const props = (event as { properties?: { sessionID?: string; status?: { type?: string } } }).properties;
         if (props?.status?.type !== "idle") return;
@@ -274,7 +311,7 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
             traceEvent(`idle skipped: subagent (${shortTitle(info.title)})`);
             return;
           }
-          if (!shouldSend("idle")) return;
+          if (!shouldSend("subagent")) return;
           traceEvent("toast: subagent idle -> sending");
           await sendToast(`opencode · 子代理完成 [${shortTitle(info.title)}]`, "子代理已返回");
           return;
@@ -288,6 +325,23 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
 
       if (type === "session.idle") {
         if (!notifyOnIdle) return;
+
+        const props = (event as { properties?: { sessionID?: string } }).properties;
+        if (props?.sessionID) {
+          const info = await sessionInfo(props.sessionID);
+          if (info.parentID) {
+            // A subagent finished; the main session is still working.
+            if (!notifySubagent) {
+              traceEvent(`idle skipped: subagent (${shortTitle(info.title)})`);
+              return;
+            }
+            if (!shouldSend("subagent")) return;
+            traceEvent("toast: subagent idle -> sending");
+            await sendToast(`opencode · 子代理完成 [${shortTitle(info.title)}]`, "子代理已返回");
+            return;
+          }
+        }
+
         if (!shouldSend("idle")) return;
         traceEvent("toast: idle -> sending");
         await sendToast(`opencode · 完成 [${workspace}]`, "agent 已结束，可以查看了");

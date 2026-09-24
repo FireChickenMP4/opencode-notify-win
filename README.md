@@ -59,7 +59,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 | 事件 | 通知 |
 |---|---|
-| 会话空闲（`session.status` 且 `status.type === "idle"`） | `opencode · 完成 [工作区路径]` |
+| 会话空闲（`session.idle`，或 `session.status` 且 `status.type === "idle"`） | `opencode · 完成 [工作区路径]` |
 | 权限请求（`permission.asked`） | `opencode · 需要授权 [工作区路径]` |
 | agent 提问（`question.asked`） | `opencode · 需要你回答 [工作区路径]` |
 | 会话出错（`session.error`） | `opencode · 出错 [工作区路径]` |
@@ -67,7 +67,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 > **标题带完整工作区路径**（主目录缩写为 `~`）。两个 opencode 开在不同项目时，
 > 一眼看出是哪条。早期只显示目录名，同名目录无法区分。
 
-> **子代理不通知（默认）**：`session.status` 带 `sessionID`，插件据此查会话记录，
+> **子代理不通知（默认）**：事件带 `sessionID`，插件据此查会话记录，
 > 若 `parentID` 非空说明是子代理——它结束时**主会话仍在跑**，报"完成"是误导。
 > 默认跳过，`OPENCODE_NOTIFY_SUBAGENT=1` 可开启，标题为
 > `opencode · 子代理完成 [<会话标题>]`（去掉 `(@general subagent)` 尾巴）。
@@ -79,9 +79,9 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 > `session.idle`，ESC 打断时甚至一秒内数条）。同类通知在 `OPENCODE_NOTIFY_DEDUP_MS`
 > （默认 3000ms）内只发一次，避免刷屏。
 
-> **注意**：opencode V2 实际**不发出** `session.idle` 事件，空闲是通过
-> `session.status` 携带 `status.type === "idle"` 表达的。插件两者都监听，以兼容
-> 不同版本。这也是早期"任务完成不弹窗"的根因。
+> **注意**：空闲信号可能来自 `session.status`（携带 `status.type === "idle"`）
+> **或**独立的 `session.idle` 事件——实测后者才是主要来源。两条路径都要做
+> 子代理判断，否则子代理结束会被误报成"任务完成"。
 
 ### 发送方式
 
@@ -125,6 +125,8 @@ ESC 中断会发 `session.error`，但 `error.name === "MessageAbortedError"`。
 | `OPENCODE_NOTIFY_ON_IDLE` | `1` | 设 `0` 只在需授权/出错时通知 |
 | `OPENCODE_NOTIFY_FLASH` | `1` | 设 `0` 关闭任务栏闪烁 |
 | `OPENCODE_NOTIFY_SUBAGENT` | `0` | 设 `1` 也通知子代理结束 |
+| `OPENCODE_NOTIFY_LOG` | `1` | 设 `0` 关闭诊断事件日志 |
+| `OPENCODE_NOTIFY_LOG_MAX` | `5242880` | 诊断日志超过此字节数即轮转到 `.1` |
 | `OPENCODE_NOTIFY_CLICK_ACTIVATE` | `0` | 设 `1` 尝试点击跳转（见上） |
 | `OPENCODE_NOTIFY_APPID` | 安装时的 AUMID | 发送者身份 |
 
