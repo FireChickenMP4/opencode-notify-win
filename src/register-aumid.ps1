@@ -1,4 +1,4 @@
-# Register an AppUserModelID (AUMID) for opencode toast notifications.
+﻿# Register an AppUserModelID (AUMID) for opencode toast notifications.
 #
 # Windows refuses CreateToastNotifier(appId) unless the appId belongs to a
 # registered app. Registration has two parts:

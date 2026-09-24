@@ -46,6 +46,10 @@ const scenario = process.env.OPENCODE_NOTIFY_SCENARIO ?? "urgent";
 const sound = process.env.OPENCODE_NOTIFY_SOUND !== "0";
 const notifyOnIdle = process.env.OPENCODE_NOTIFY_ON_IDLE !== "0";
 const debug = process.env.OPENCODE_NOTIFY_DEBUG === "1";
+/** Click a toast to bring the originating window to the front (best-effort). */
+const clickToActivate = process.env.OPENCODE_NOTIFY_CLICK_ACTIVATE === "1";
+/** Flash the taskbar button so the window draws attention. On by default. */
+const flashWindow = process.env.OPENCODE_NOTIFY_FLASH !== "0";
 
 const SCRIPT = SCRIPT_CANDIDATES.find((p) => existsSync(p)) ?? SCRIPT_CANDIDATES[0]!;
 
@@ -112,6 +116,14 @@ function runPowerShellToast(
           NOTIFY_MSG: message.slice(0, 400),
           NOTIFY_SCENARIO: overrideScenario ?? scenario,
           NOTIFY_SOUND: sound ? "1" : "0",
+          // Flash the taskbar button of the window hosting this session. Pure
+          // Win32, works reliably from a script.
+          ...(flashWindow ? { NOTIFY_FLASH_PID: String(process.pid) } : {}),
+          // Click-to-activate is best-effort: the launch URI is set, but a
+          // toast submitted by a plain PowerShell script does not receive the
+          // click callback (that needs a COM INotificationActivationCallback).
+          // Kept so it works wherever the platform does deliver the click.
+          ...(clickToActivate ? { NOTIFY_ACTIVATE_PID: String(process.pid) } : {}),
         },
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
@@ -174,11 +186,23 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
     })
     .catch(() => {});
 
-  /** A short label for the project, so notifications are distinguishable. */
-  const projectLabel = (() => {
-    const base = (directory || process.cwd()).replace(/\\/g, "/").split("/").filter(Boolean).pop();
-    return base ?? "opencode";
+  /**
+   * Identify the session's workspace unambiguously.
+   *
+   * Only the basename was shown before, so two opencode sessions in different
+   * projects with the same folder name (or the same project opened twice) were
+   * indistinguishable in a notification. The full path (with a ~ shorthand for
+   * the home dir) tells you which one fired.
+   */
+  const workspace = (() => {
+    const dir = directory || process.cwd();
+    const home = process.env.USERPROFILE || process.env.HOME || "";
+    const short = home && dir.toLowerCase().startsWith(home.toLowerCase()) ? `~${dir.slice(home.length)}` : dir;
+    return short.replace(/\\/g, "/");
   })();
+
+  /** Last path segment, used where a short label reads better. */
+  const workspaceName = workspace.split("/").filter(Boolean).pop() ?? "opencode";
 
   return {
     event: async ({ event }) => {
@@ -210,7 +234,7 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
           if (!notifyOnIdle) return;
           if (!shouldSend("idle")) return;
           traceEvent("toast: status idle -> sending");
-          await sendToast(`${projectLabel} · 完成`, "agent 已结束，可以查看了");
+          await sendToast(`opencode · 完成 [${workspace}]`, "agent 已结束，可以查看了");
         }
         return;
       }
@@ -219,14 +243,14 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
         if (!notifyOnIdle) return;
         if (!shouldSend("idle")) return;
         traceEvent("toast: idle -> sending");
-        await sendToast(`${projectLabel} · 完成`, "agent 已结束，可以查看了");
+        await sendToast(`opencode · 完成 [${workspace}]`, "agent 已结束，可以查看了");
         return;
       }
 
       if (type === "permission.asked" || type === "permission.updated") {
         if (!shouldSend("permission")) return;
         traceEvent("toast: permission -> sending");
-        await sendToast(`${projectLabel} · 需要授权`, "agent 正在等待你的权限确认", "urgent");
+        await sendToast(`opencode · 需要授权 [${workspace}]`, "agent 正在等待你的权限确认", "urgent");
         return;
       }
 
@@ -235,7 +259,7 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
       if (type === "question.asked") {
         if (!shouldSend("question")) return;
         traceEvent("toast: question -> sending");
-        await sendToast(`${projectLabel} · 需要你回答`, "agent 提了一个问题，等待你的决定", "urgent");
+        await sendToast(`opencode · 需要你回答 [${workspace}]`, "agent 提了一个问题，等待你的决定", "urgent");
         return;
       }
 
@@ -250,7 +274,7 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
         }
         if (!shouldSend("error")) return;
         traceEvent(`toast: error -> sending (${errName ?? "unknown"})`);
-        await sendToast(`${projectLabel} · 出错`, "会话发生错误，请检查", "urgent");
+        await sendToast(`opencode · 出错 [${workspace}]`, "会话发生错误，请检查", "urgent");
         return;
       }
     },

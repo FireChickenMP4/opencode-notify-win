@@ -59,10 +59,16 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 | 事件 | 通知 |
 |---|---|
-| 会话空闲（`session.status` 且 `status.type === "idle"`） | `{项目名} · 完成` |
-| 权限请求（`permission.asked`） | `{项目名} · 需要授权` |
-| agent 提问（`question.asked`） | `{项目名} · 需要你回答` |
-| 会话出错（`session.error`） | `{项目名} · 出错` |
+| 会话空闲（`session.status` 且 `status.type === "idle"`） | `opencode · 完成 [工作区路径]` |
+| 权限请求（`permission.asked`） | `opencode · 需要授权 [工作区路径]` |
+| agent 提问（`question.asked`） | `opencode · 需要你回答 [工作区路径]` |
+| 会话出错（`session.error`） | `opencode · 出错 [工作区路径]` |
+
+> **标题带完整工作区路径**（主目录缩写为 `~`）。两个 opencode 开在不同项目时，
+> 一眼看出是哪条。早期只显示目录名，同名目录无法区分。
+
+**任务栏闪烁**：通知到达时同时让对应窗口的任务栏按钮闪烁（`FlashWindowEx`）。
+即使错过弹窗也能注意到。可用 `OPENCODE_NOTIFY_FLASH=0` 关闭。
 
 > **去抖**：一次"回合结束"可能连发多个空闲信号（`session.status` idle 与
 > `session.idle`，ESC 打断时甚至一秒内数条）。同类通知在 `OPENCODE_NOTIFY_DEDUP_MS`
@@ -88,6 +94,20 @@ Toast 用**异步 spawn 并 await 退出**发送（不 detached），且**串行
 ESC 中断会发 `session.error`，但 `error.name === "MessageAbortedError"`。
 这是用户主动打断，不是故障，插件会跳过，不报"出错"。
 
+### 点击跳转（部分可用）
+
+通知的 XML 带 `activationType="protocol" launch="opencode-notify://activate?pid=<pid>"`，
+协议注册后，点击会把承载该会话的终端/编辑器窗口拉到前台。
+
+**但实测：从通知点击不触发回调**——非 UWP 应用需要实现 COM
+`INotificationActivationCallback` 才行，纯 PowerShell 发的 Toast 做不到。
+手动调用 `Start-Process opencode-notify://activate?pid=...` 是有效的。
+
+**已知限制**：Windows Terminal 没有"按标签身份聚焦"的接口，所以两个 opencode
+在**同一窗口不同标签**时，最多把窗口拉到前台，**不会切标签**。
+
+详见 [TODO.md](./TODO.md)（含 BurntToast 方案评估）。
+
 ## 配置
 
 环境变量：
@@ -98,6 +118,8 @@ ESC 中断会发 `session.error`，但 `error.name === "MessageAbortedError"`。
 | `OPENCODE_NOTIFY_SCENARIO` | `urgent` | `default` / `urgent` / `alarm` / `reminder` |
 | `OPENCODE_NOTIFY_SOUND` | `1` | 设 `0` 静音 |
 | `OPENCODE_NOTIFY_ON_IDLE` | `1` | 设 `0` 只在需授权/出错时通知 |
+| `OPENCODE_NOTIFY_FLASH` | `1` | 设 `0` 关闭任务栏闪烁 |
+| `OPENCODE_NOTIFY_CLICK_ACTIVATE` | `0` | 设 `1` 尝试点击跳转（见上） |
 | `OPENCODE_NOTIFY_APPID` | 安装时的 AUMID | 发送者身份 |
 
 ### scenario 与勿扰穿透
@@ -116,6 +138,7 @@ ESC 中断会发 `session.error`，但 `error.name === "MessageAbortedError"`。
 ```powershell
 $env:NOTIFY_TITLE = "opencode"; $env:NOTIFY_MSG = "测试中文"
 $env:NOTIFY_SCENARIO = "urgent"
+$env:NOTIFY_FLASH_PID = $PID        # 同时闪当前窗口
 & "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass `
   -File "$env:USERPROFILE\.config\opencode\plugins\notify\notify.ps1"
 ```
@@ -126,6 +149,7 @@ $env:NOTIFY_SCENARIO = "urgent"
 Remove-Item "$env:USERPROFILE\.config\opencode\plugins\notify-windows.ts" -Force
 Remove-Item "$env:USERPROFILE\.config\opencode\plugins\notify" -Recurse -Force
 Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\opencode workflow.lnk" -Force
+Remove-Item "HKCU:\SOFTWARE\Classes\opencode-notify" -Recurse -Force
 ```
 
 ## 踩过的坑（实现要点）
@@ -135,15 +159,23 @@ Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\opencode workflo
 3. **参数用环境变量传**：PowerShell 命令行参数对非 ASCII 编码不可靠
 4. **AUMID 必须先注册**：没有 Start Menu 快捷方式 + `PKEY_AppUserModel_ID`，`CreateToastNotifier` 会报 `applicationId` 错误
 5. **`scenario` 决定勿扰行为**：见上表
+6. **点击回调需要 COM**：见"点击跳转"一节
+7. **PS 5.1 的 C# 编译器不支持 `out _` 与字符串插值**：`Add-Type` 内联 C# 时要用具名变量、字符串拼接
 
 ## 文件
 
 ```text
 src/
-  notify.ps1           # PS 5.1 发送器（环境变量传参，UTF-8 BOM）
-  notify-windows.ts    # opencode plugin（挂 session 事件）
-  register-aumid.ps1   # 注册 AUMID（幂等）
-install.ps1            # 一键安装
+  notify-windows.ts      # opencode plugin（挂 session 事件）
+  notify/
+    notify.ps1           # 发送器（弹窗 + 闪烁，环境变量传参，UTF-8 BOM）
+    flash-window.ps1     # 任务栏闪烁（FlashWindowEx）
+    activate-window.ps1  # 激活窗口（沿进程链找宿主）
+    handle-protocol.ps1  # 协议回调入口
+    register-protocol.ps1# 注册 opencode-notify:// 协议
+  register-aumid.ps1     # 注册 AUMID（幂等）
+install.ps1              # 一键安装
+TODO.md                  # 未完成项（点击跳转方案评估等）
 ```
 
 ## License
