@@ -133,6 +133,28 @@ ESC 中断会发 `session.error`，但 `error.name === "MessageAbortedError"`。
 
 默认 `urgent`：够用且不吵。若你的勿扰是「仅闹钟」，改 `OPENCODE_NOTIFY_SCENARIO=alarm`。
 
+### 延迟
+
+一次通知（弹窗 + 闪烁）约 **600ms**。构成：
+
+| 步骤 | 耗时 | 备注 |
+|---|---|---|
+| PowerShell 5.1 冷启动 | ~120ms | 改不掉（除非不用 pwsh） |
+| WinRT 类型加载 | ~40ms | |
+| Toast 显示 | ~70ms | |
+| `Add-Type` 编译（闪烁用） | ~90ms | 每次调用重编译 |
+| 进程快照 | ~145ms | |
+
+优化过的两点（原先 1178ms → 现在 600ms）：
+
+1. **闪烁内联进 `notify.ps1`**：不再另起子进程跑 `flash-window.ps1`，省一次
+   pwsh 启动 + 一次 Add-Type 编译。
+2. **进程链用一次快照，不逐跳查询**：`Get-CimInstance` 逐跳调用 8 次要 ~1.3s，
+   一次拿全表只要 ~145ms。
+
+> 想再快可用 `NtQueryInformationProcess` 把快照压到 ~30ms，但代码复杂度上升，
+> 收益有限，暂未做。
+
 ## 手动测试
 
 ```powershell

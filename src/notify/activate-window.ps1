@@ -1,14 +1,14 @@
 ﻿# Activate the terminal (or editor) window that hosts a given process.
 #
 # Called by the notification click handler, or manually:
-#   powershell -File activate-window.ps1 -Pid 12345
+#   powershell -File activate-window.ps1 -TargetPid 12345
 #
 # Why a separate process: SetForegroundWindow only succeeds reliably when the
 # caller is allowed to take focus. When invoked from a toast click, Windows
 # grants that; a background process usually cannot.
 #
 # Strategy:
-#   1. walk up from the pid to find a hostable window (terminal / code / etc.)
+#   1. walk up from the pid to find a hostable window (terminal / editor / etc.)
 #   2. restore it if minimized, then force it to the foreground
 
 param(
@@ -58,50 +58,51 @@ public static class WinActivate {
         }
     }
 
-    public static bool HasWindow(int pid) {
-        try { return System.Diagnostics.Process.GetProcessById(pid).MainWindowHandle != IntPtr.Zero; }
-        catch { return false; }
+    public static IntPtr HandleOf(int pid) {
+        try { return System.Diagnostics.Process.GetProcessById(pid).MainWindowHandle; }
+        catch { return IntPtr.Zero; }
     }
 }
 "@
 
-# Walk up the parent chain: the notification carries a shell/opencode pid, but
-# the window belongs to the terminal or editor hosting it.
-# Note: Win32_Process.Name includes the ".exe" suffix, so compare basenames.
-$hosts = @("WindowsTerminal", "WindowsTerminalPreview", "Code", "code", "powershell", "pwsh", "cmd", "conhost", "wezterm-gui")
-
-$current = $TargetPid
-for ($i = 0; $i -lt 11 -and $current -gt 0; $i++) {
-    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction SilentlyContinue
-    if (-not $proc) { break }
-
-    $name = [System.IO.Path]::GetFileNameWithoutExtension($proc.Name)
-
-    if ($env:NOTIFY_ACTIVATE_DEBUG -eq "1") {
-        Write-Output ("  chain: " + $proc.ProcessId + " " + $proc.Name + " (base=" + $name + ")")
-    }
-
-    if ($hosts -contains $name) {
-        $r = [WinActivate]::Activate($current)
-        if ($r -eq "ok") {
-            Write-Output ("activated " + $proc.Name + " pid=" + $current)
-            exit 0
-        }
-        Write-Output ("found " + $proc.Name + " pid=" + $current + " but activation returned: " + $r)
-    }
-    $current = $proc.ParentProcessId
+# One process snapshot, not one CIM call per hop (per-hop was ~1.3s for 8 hops).
+$snapshot = @{}
+foreach ($p in (Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name)) {
+    $snapshot[[int]$p.ProcessId] = $p
 }
 
-# Fallback: any window-having ancestor.
-$current = $TargetPid
-for ($i = 0; $i -lt 11 -and $current -gt 0; $i++) {
-    if ([WinActivate]::HasWindow($current)) {
-        $r = [WinActivate]::Activate($current)
-        if ($r -eq "ok") { Write-Output ("activated pid=" + $current); exit 0 }
+$hosts = @("WindowsTerminal", "WindowsTerminalPreview", "Code", "code", "powershell", "pwsh", "cmd", "conhost", "wezterm-gui")
+
+function Walk-Chain {
+    param([int]$Start, [bool]$RequireHost)
+    $cur = $Start
+    for ($i = 0; $i -lt 11 -and $cur -gt 0) {
+        $p = $snapshot[$cur]
+        if (-not $p) { break }
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($p.Name)
+
+        if ((-not $RequireHost) -or ($hosts -contains $name)) {
+            if ([WinActivate]::HandleOf($cur) -ne [IntPtr]::Zero) {
+                return @{ Pid = $cur; Name = $p.Name }
+            }
+        }
+        $cur = [int]$p.ParentProcessId
+        $i++
     }
-    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction SilentlyContinue
-    if (-not $proc) { break }
-    $current = $proc.ParentProcessId
+    return $null
+}
+
+$hit = Walk-Chain -Start $TargetPid -RequireHost $true
+if (-not $hit) { $hit = Walk-Chain -Start $TargetPid -RequireHost $false }
+
+if ($hit) {
+    $r = [WinActivate]::Activate($hit.Pid)
+    if ($r -eq "ok") {
+        Write-Output ("activated " + $hit.Name + " pid=" + $hit.Pid)
+        exit 0
+    }
+    Write-Output ("found " + $hit.Name + " pid=" + $hit.Pid + " but activation returned: " + $r)
+    exit 1
 }
 
 Write-Output "no activatable window found"

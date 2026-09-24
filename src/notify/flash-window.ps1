@@ -29,7 +29,6 @@ public static class WinFlash {
     [DllImport("user32.dll")]
     static extern bool FlashWindowEx(ref FLASHWINFO pwfi);
 
-    // Flash continuously until the window comes to the foreground.
     const uint FLASHW_ALL = 3;
     const uint FLASHW_TIMERNOFG = 12;
 
@@ -51,35 +50,46 @@ public static class WinFlash {
 }
 "@
 
-# Same walk as activate-window.ps1: the toast carries a shell/opencode pid, but
-# the taskbar button belongs to the hosting terminal or editor.
-$hosts = @("WindowsTerminal", "WindowsTerminalPreview", "Code", "code", "powershell", "pwsh", "cmd", "conhost", "wezterm-gui")
-
-$current = $TargetPid
-for ($i = 0; $i -lt 11 -and $current -gt 0; $i++) {
-    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction SilentlyContinue
-    if (-not $proc) { break }
-    $name = [System.IO.Path]::GetFileNameWithoutExtension($proc.Name)
-
-    if ($hosts -contains $name) {
-        $h = [WinFlash]::HandleOf($current)
-        if ($h -ne [IntPtr]::Zero) {
-            if ([WinFlash]::Flash($h)) { Write-Output ("flashed " + $proc.Name + " pid=" + $current); exit 0 }
-        }
-    }
-    $current = $proc.ParentProcessId
+# Build the parent map ONCE. Calling Get-CimInstance per hop took ~1.3s for 8
+# hops; a single snapshot is ~145ms for the whole process table.
+$snapshot = @{}
+foreach ($p in (Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name)) {
+    $snapshot[[int]$p.ProcessId] = $p
 }
 
-# Fallback: any ancestor with a window.
-$current = $TargetPid
-for ($i = 0; $i -lt 11 -and $current -gt 0; $i++) {
-    $h = [WinFlash]::HandleOf($current)
-    if ($h -ne [IntPtr]::Zero -and [WinFlash]::Flash($h)) {
-        Write-Output ("flashed pid=" + $current); exit 0
+$hosts = @("WindowsTerminal", "WindowsTerminalPreview", "Code", "code", "powershell", "pwsh", "cmd", "conhost", "wezterm-gui")
+
+function Walk-Chain {
+    param([int]$Start, [bool]$RequireHost)
+    $cur = $Start
+    for ($i = 0; $i -lt 11 -and $cur -gt 0) {
+        $p = $snapshot[$cur]
+        if (-not $p) { break }
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($p.Name)
+
+        if ((-not $RequireHost) -or ($hosts -contains $name)) {
+            $h = [WinFlash]::HandleOf($cur)
+            if ($h -ne [IntPtr]::Zero) {
+                return @{ Pid = $cur; Name = $p.Name; Handle = $h }
+            }
+        }
+        $cur = [int]$p.ParentProcessId
+        $i++
     }
-    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction SilentlyContinue
-    if (-not $proc) { break }
-    $current = $proc.ParentProcessId
+    return $null
+}
+
+# Prefer a known host process, then fall back to any ancestor with a window.
+$hit = Walk-Chain -Start $TargetPid -RequireHost $true
+if (-not $hit) { $hit = Walk-Chain -Start $TargetPid -RequireHost $false }
+
+if ($hit) {
+    if ([WinFlash]::Flash([IntPtr]$hit.Handle)) {
+        Write-Output ("flashed " + $hit.Name + " pid=" + $hit.Pid)
+        exit 0
+    }
+    Write-Output ("found " + $hit.Name + " pid=" + $hit.Pid + " but FlashWindowEx failed")
+    exit 1
 }
 
 Write-Output "no flasheable window found"
