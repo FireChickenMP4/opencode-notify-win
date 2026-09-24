@@ -204,6 +204,40 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
   /** Last path segment, used where a short label reads better. */
   const workspaceName = workspace.split("/").filter(Boolean).pop() ?? "opencode";
 
+  /** Subagent activity is frequent; only notify about it on request. */
+  const notifySubagent = process.env.OPENCODE_NOTIFY_SUBAGENT === "1";
+
+  type SessionInfo = { parentID?: string; title?: string };
+  const sessionCache = new Map<string, SessionInfo>();
+
+  /**
+   * Resolve whether a session is a subagent, and its title.
+   *
+   * `session.status` carries a sessionID but not the session record. We look it
+   * up via the SDK so a subagent's finish is not reported as if the main turn
+   * ended (the main session is still running while a subagent works).
+   */
+  async function sessionInfo(sessionID: string): Promise<SessionInfo> {
+    const cached = sessionCache.get(sessionID);
+    if (cached) return cached;
+    try {
+      const res = await client.session.get({ path: { id: sessionID } });
+      const data = (res as { data?: SessionInfo }).data;
+      const info: SessionInfo = { parentID: data?.parentID, title: data?.title };
+      sessionCache.set(sessionID, info);
+      return info;
+    } catch {
+      // Fail open: unknown session is treated as a main session.
+      return {};
+    }
+  }
+
+  /** Drop the "(@general subagent)" tail and cap the length for a toast. */
+  function shortTitle(title: string | undefined): string {
+    if (!title) return "子代理";
+    return title.replace(/\s*\(@\w+\s+subagent\)\s*$/i, "").trim().slice(0, 60) || "子代理";
+  }
+
   return {
     event: async ({ event }) => {
       const type = event.type;
@@ -229,13 +263,26 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
       // === "idle". The standalone session.idle event is not emitted in
       // practice, which is why an idle-only hook never fired.
       if (type === "session.status") {
-        const status = (event as { properties?: { status?: { type?: string } } }).properties?.status;
-        if (status?.type === "idle") {
-          if (!notifyOnIdle) return;
+        const props = (event as { properties?: { sessionID?: string; status?: { type?: string } } }).properties;
+        if (props?.status?.type !== "idle") return;
+        if (!notifyOnIdle) return;
+
+        const info = props.sessionID ? await sessionInfo(props.sessionID) : {};
+        if (info.parentID) {
+          // A subagent finished; the main session is still working.
+          if (!notifySubagent) {
+            traceEvent(`idle skipped: subagent (${shortTitle(info.title)})`);
+            return;
+          }
           if (!shouldSend("idle")) return;
-          traceEvent("toast: status idle -> sending");
-          await sendToast(`opencode · 完成 [${workspace}]`, "agent 已结束，可以查看了");
+          traceEvent("toast: subagent idle -> sending");
+          await sendToast(`opencode · 子代理完成 [${shortTitle(info.title)}]`, "子代理已返回");
+          return;
         }
+
+        if (!shouldSend("idle")) return;
+        traceEvent("toast: status idle -> sending");
+        await sendToast(`opencode · 完成 [${workspace}]`, "agent 已结束，可以查看了");
         return;
       }
 

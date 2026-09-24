@@ -67,6 +67,11 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 > **标题带完整工作区路径**（主目录缩写为 `~`）。两个 opencode 开在不同项目时，
 > 一眼看出是哪条。早期只显示目录名，同名目录无法区分。
 
+> **子代理不通知（默认）**：`session.status` 带 `sessionID`，插件据此查会话记录，
+> 若 `parentID` 非空说明是子代理——它结束时**主会话仍在跑**，报"完成"是误导。
+> 默认跳过，`OPENCODE_NOTIFY_SUBAGENT=1` 可开启，标题为
+> `opencode · 子代理完成 [<会话标题>]`（去掉 `(@general subagent)` 尾巴）。
+
 **任务栏闪烁**：通知到达时同时让对应窗口的任务栏按钮闪烁（`FlashWindowEx`）。
 即使错过弹窗也能注意到。可用 `OPENCODE_NOTIFY_FLASH=0` 关闭。
 
@@ -119,6 +124,7 @@ ESC 中断会发 `session.error`，但 `error.name === "MessageAbortedError"`。
 | `OPENCODE_NOTIFY_SOUND` | `1` | 设 `0` 静音 |
 | `OPENCODE_NOTIFY_ON_IDLE` | `1` | 设 `0` 只在需授权/出错时通知 |
 | `OPENCODE_NOTIFY_FLASH` | `1` | 设 `0` 关闭任务栏闪烁 |
+| `OPENCODE_NOTIFY_SUBAGENT` | `0` | 设 `1` 也通知子代理结束 |
 | `OPENCODE_NOTIFY_CLICK_ACTIVATE` | `0` | 设 `1` 尝试点击跳转（见上） |
 | `OPENCODE_NOTIFY_APPID` | 安装时的 AUMID | 发送者身份 |
 
