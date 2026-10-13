@@ -14,10 +14,15 @@
  *   OPENCODE_NOTIFY_LOG=0        disable the diagnostics event log
  *   OPENCODE_NOTIFY_LOG_MAX      rotate the diagnostics log past this many bytes
  *   OPENCODE_NOTIFY_APPID        AUMID to send as
+ *   OPENCODE_NOTIFY_DEDUP_MS     suppress a repeated notification of the same kind (default 3000)
+ *   OPENCODE_NOTIFY_PERMISSION_GRACE_MS
+ *                                how long a permission must stay unanswered before notifying
+ *                                (auto-accepted requests are answered sooner; default 1500)
  */
 
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, renameSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "@opencode/plugin";
@@ -93,6 +98,7 @@ const TRACED_EVENTS = new Set([
 type NotifyEvent = {
   type: string;
   data?: {
+    id?: string;
     sessionID?: string;
     status?: { type?: string };
     error?: { type?: string; message?: string };
@@ -105,19 +111,41 @@ type NotifyEvent = {
  * A single "turn finished" can fire several idle signals (session.status idle
  * and session.idle, sometimes twice in the same second, and an ESC interrupt
  * produces a burst). Without this, one end-of-turn becomes four toasts.
+ *
+ * The window is claimed through the filesystem rather than an in-memory map:
+ * opencode loads a local plugin more than once, and the instances do not share
+ * module state, so a counter would let each one toast the same event.
  */
 const DEDUP_MS = Number(process.env.OPENCODE_NOTIFY_DEDUP_MS ?? 3000);
-const lastSent = new Map<string, number>();
+const DEDUP_DIR = join(tmpdir(), "opencode-notify", "notify-windows");
+
+/** Only notify about a permission that is still unanswered after this long. */
+const PERMISSION_GRACE_MS = Number(process.env.OPENCODE_NOTIFY_PERMISSION_GRACE_MS ?? 1500);
 
 function shouldSend(kind: string): boolean {
-  const now = Date.now();
-  const prev = lastSent.get(kind) ?? 0;
-  if (now - prev < DEDUP_MS) {
+  const claim = join(DEDUP_DIR, kind);
+  try {
+    mkdirSync(DEDUP_DIR, { recursive: true });
+    // An exclusive create succeeds for exactly one instance per window.
+    mkdirSync(claim);
+    return true;
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException)?.code !== "EEXIST") {
+      // Cannot claim at all: fail open, a notification matters more than noise.
+      return true;
+    }
+    try {
+      // A winner that never came back (crash) must not block the kind forever.
+      if (Date.now() - statSync(claim).mtimeMs >= DEDUP_MS) {
+        rmSync(claim, { recursive: true, force: true });
+        return shouldSend(kind);
+      }
+    } catch {
+      /* the claim vanished between the two calls */
+    }
     traceEvent(`toast: suppressed duplicate ${kind} (within ${DEDUP_MS}ms)`);
     return false;
   }
-  lastSent.set(kind, now);
-  return true;
 }
 
 /**
@@ -294,6 +322,26 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
     await sendToast(`opencode · 完成 [${workspace}]`, "agent 已结束，可以查看了");
   }
 
+  /**
+   * True when a permission request is still unanswered after a short grace.
+   *
+   * opencode can accept a request automatically, which resolves it almost
+   * immediately; a notification for that is pure noise. Fails open: a lookup
+   * error counts as "still waiting", so a real notice is never lost.
+   */
+  async function stillWaiting(data: NotifyEvent["data"]): Promise<boolean> {
+    const sessionID = data?.sessionID;
+    const requestID = data?.id;
+    if (!sessionID || !requestID) return true;
+    await new Promise((r) => setTimeout(r, PERMISSION_GRACE_MS));
+    try {
+      const pending = await ctx.permission.list({ sessionID });
+      return pending.some((p) => p.id === requestID);
+    } catch {
+      return true;
+    }
+  }
+
   /** Handle one V2 event; V2 carries every payload under `data`. */
   async function handleEvent(event: NotifyEvent): Promise<void> {
     const type = event.type;
@@ -324,6 +372,12 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
     }
 
     if (type === "permission.asked") {
+      // An auto-accepted request is answered within milliseconds; only a
+      // request that is genuinely waiting for you deserves a toast.
+      if (!(await stillWaiting(event.data))) {
+        traceEvent("permission skipped: already resolved");
+        return;
+      }
       if (!shouldSend("permission")) return;
       traceEvent("toast: permission -> sending");
       await sendToast(`opencode · 需要授权 [${workspace}]`, "agent 正在等待你的权限确认", "urgent");
