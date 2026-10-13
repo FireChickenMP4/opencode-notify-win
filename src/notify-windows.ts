@@ -20,7 +20,7 @@ import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Plugin } from "@opencode-ai/plugin";
+import type { Plugin } from "@opencode/plugin";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -82,10 +82,22 @@ const TRACED_EVENTS = new Set([
   "session.status",
   "session.idle",
   "permission.asked",
-  "permission.updated",
-  "question.asked",
-  "session.error",
+  "form.created",
+  "session.execution.failed",
 ]);
+
+/**
+ * Shape of the events this plugin reads. V2 carries every payload under `data`
+ * (V1 used `properties`), and only the fields actually used are declared here.
+ */
+type NotifyEvent = {
+  type: string;
+  data?: {
+    sessionID?: string;
+    status?: { type?: string };
+    error?: { type?: string; message?: string };
+  };
+};
 
 /**
  * De-duplicate notifications of the same kind within a short window.
@@ -192,33 +204,21 @@ function runPowerShellToast(
   });
 }
 
-export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
+/** V2 plugin entrypoint. Returns a cleanup that stops the event subscription. */
+async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
   if (!enabled || process.platform !== "win32") {
-    return {};
+    return;
   }
   if (!existsSync(SCRIPT)) {
-    await client.app
-      .log({
-        body: {
-          service: "notify-windows",
-          level: "warn",
-          message: `notify.ps1 not found (looked in: ${SCRIPT_CANDIDATES.join(", ")}); notifications disabled`,
-        },
-      })
-      .catch(() => {});
-    return {};
+    console.error(
+      `[notify-windows] notify.ps1 not found (looked in: ${SCRIPT_CANDIDATES.join(", ")}); notifications disabled`,
+    );
+    return;
   }
 
-  await client.app
-    .log({
-      body: {
-        service: "notify-windows",
-        level: "info",
-        message: "Windows toast notifications enabled",
-        extra: { scenario, sound, notifyOnIdle },
-      },
-    })
-    .catch(() => {});
+  console.log(
+    `[notify-windows] Windows toast notifications enabled (scenario=${scenario}, sound=${sound}, onIdle=${notifyOnIdle})`,
+  );
 
   /**
    * Identify the session's workspace unambiguously.
@@ -229,7 +229,7 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
    * the home dir) tells you which one fired.
    */
   const workspace = (() => {
-    const dir = directory || process.cwd();
+    const dir = ctx.location.directory || process.cwd();
     const home = process.env.USERPROFILE || process.env.HOME || "";
     const short = home && dir.toLowerCase().startsWith(home.toLowerCase()) ? `~${dir.slice(home.length)}` : dir;
     return short.replace(/\\/g, "/");
@@ -255,9 +255,9 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
     const cached = sessionCache.get(sessionID);
     if (cached) return cached;
     try {
-      const res = await client.session.get({ path: { id: sessionID } });
-      const data = (res as { data?: SessionInfo }).data;
-      const info: SessionInfo = { parentID: data?.parentID, title: data?.title };
+      // V2 returns the session record directly, not a `{ data }` envelope.
+      const data = await ctx.session.get({ sessionID });
+      const info: SessionInfo = { parentID: data.parentID, title: data.title };
       sessionCache.set(sessionID, info);
       return info;
     } catch {
@@ -272,112 +272,102 @@ export const NotifyWindowsPlugin: Plugin = async ({ client, directory }) => {
     return title.replace(/\s*\(@\w+\s+subagent\)\s*$/i, "").trim().slice(0, 60) || "子代理";
   }
 
-  return {
-    event: async ({ event }) => {
-      const type = event.type;
+  /** A finished turn is reported once; a subagent's finish is not the main turn ending. */
+  async function notifyIdle(sessionID: string | undefined): Promise<void> {
+    if (!notifyOnIdle) return;
 
-      // Diagnostics: set OPENCODE_NOTIFY_DEBUG=1 to log every event, which is
-      // how you tell "hook not called" from "wrong event name".
-      if (debug) {
-        await client.app
-          .log({
-            body: {
-              service: "notify-windows",
-              level: "info",
-              message: `event: ${type}`,
-              extra: { payload: JSON.stringify(event).slice(0, 300) },
-            },
-          })
-          .catch(() => {});
-      }
-
-      // Only trace events this plugin acts on. Streaming deltas
-      // (message.part.delta) fire per token and once accounted for a 40MB log;
-      // the full event dump is available behind OPENCODE_NOTIFY_DEBUG=1.
-      if (TRACED_EVENTS.has(type)) traceEvent(`event:${type}`);
-
-      // Both session.status/idle and the standalone session.idle carry the
-      // sessionID; whichever fires, the subagent check must run so a subagent
-      // finishing is not reported as the main turn ending.
-      if (type === "session.status") {
-        const props = (event as { properties?: { sessionID?: string; status?: { type?: string } } }).properties;
-        if (props?.status?.type !== "idle") return;
-        if (!notifyOnIdle) return;
-
-        const info = props.sessionID ? await sessionInfo(props.sessionID) : {};
-        if (info.parentID) {
-          // A subagent finished; the main session is still working.
-          if (!notifySubagent) {
-            traceEvent(`idle skipped: subagent (${shortTitle(info.title)})`);
-            return;
-          }
-          if (!shouldSend("subagent")) return;
-          traceEvent("toast: subagent idle -> sending");
-          await sendToast(`opencode · 子代理完成 [${shortTitle(info.title)}]`, "子代理已返回");
-          return;
-        }
-
-        if (!shouldSend("idle")) return;
-        traceEvent("toast: status idle -> sending");
-        await sendToast(`opencode · 完成 [${workspace}]`, "agent 已结束，可以查看了");
+    const info = sessionID ? await sessionInfo(sessionID) : {};
+    if (info.parentID) {
+      // A subagent finished; the main session is still working.
+      if (!notifySubagent) {
+        traceEvent(`idle skipped: subagent (${shortTitle(info.title)})`);
         return;
       }
+      if (!shouldSend("subagent")) return;
+      traceEvent("toast: subagent idle -> sending");
+      await sendToast(`opencode · 子代理完成 [${shortTitle(info.title)}]`, "子代理已返回");
+      return;
+    }
 
-      if (type === "session.idle") {
-        if (!notifyOnIdle) return;
+    if (!shouldSend("idle")) return;
+    traceEvent("toast: idle -> sending");
+    await sendToast(`opencode · 完成 [${workspace}]`, "agent 已结束，可以查看了");
+  }
 
-        const props = (event as { properties?: { sessionID?: string } }).properties;
-        if (props?.sessionID) {
-          const info = await sessionInfo(props.sessionID);
-          if (info.parentID) {
-            // A subagent finished; the main session is still working.
-            if (!notifySubagent) {
-              traceEvent(`idle skipped: subagent (${shortTitle(info.title)})`);
-              return;
-            }
-            if (!shouldSend("subagent")) return;
-            traceEvent("toast: subagent idle -> sending");
-            await sendToast(`opencode · 子代理完成 [${shortTitle(info.title)}]`, "子代理已返回");
-            return;
-          }
-        }
+  /** Handle one V2 event; V2 carries every payload under `data`. */
+  async function handleEvent(event: NotifyEvent): Promise<void> {
+    const type = event.type;
 
-        if (!shouldSend("idle")) return;
-        traceEvent("toast: idle -> sending");
-        await sendToast(`opencode · 完成 [${workspace}]`, "agent 已结束，可以查看了");
+    // Diagnostics: set OPENCODE_NOTIFY_DEBUG=1 to log every event, which is
+    // how you tell "hook not called" from "wrong event name".
+    if (debug) {
+      console.log(`[notify-windows] event: ${type} ${JSON.stringify(event).slice(0, 300)}`);
+    }
+
+    // Only trace events this plugin acts on. Streaming deltas
+    // (session.text.delta) fire per token and once accounted for a 40MB log;
+    // the full event dump is available behind OPENCODE_NOTIFY_DEBUG=1.
+    if (TRACED_EVENTS.has(type)) traceEvent(`event:${type}`);
+
+    // Both session.status/idle and the standalone session.idle carry the
+    // sessionID; whichever fires, the subagent check must run so a subagent
+    // finishing is not reported as the main turn ending.
+    if (type === "session.status") {
+      if (event.data?.status?.type !== "idle") return;
+      await notifyIdle(event.data?.sessionID);
+      return;
+    }
+
+    if (type === "session.idle") {
+      await notifyIdle(event.data?.sessionID);
+      return;
+    }
+
+    if (type === "permission.asked") {
+      if (!shouldSend("permission")) return;
+      traceEvent("toast: permission -> sending");
+      await sendToast(`opencode · 需要授权 [${workspace}]`, "agent 正在等待你的权限确认", "urgent");
+      return;
+    }
+
+    // The agent asked the user a question (the `question` tool). V2 surfaces it
+    // as `form.created`; it is the "needs a decision" case and must reach the
+    // user reliably.
+    if (type === "form.created") {
+      if (!shouldSend("question")) return;
+      traceEvent("toast: question -> sending");
+      await sendToast(`opencode · 需要你回答 [${workspace}]`, "agent 提了一个问题，等待你的决定", "urgent");
+      return;
+    }
+
+    // A failed turn. An ESC interrupt is not a failure: V2 reports a deliberate
+    // interrupt as session.execution.interrupted (ignored here), and any abort
+    // that still surfaces as an error carries MessageAbortedError.
+    if (type === "session.execution.failed") {
+      if (event.data?.error?.type === "MessageAbortedError") {
+        traceEvent("toast: skipped (user aborted)");
         return;
       }
+      if (!shouldSend("error")) return;
+      traceEvent(`toast: error -> sending (${event.data?.error?.type ?? "unknown"})`);
+      await sendToast(`opencode · 出错 [${workspace}]`, "会话发生错误，请检查", "urgent");
+      return;
+    }
+  }
 
-      if (type === "permission.asked" || type === "permission.updated") {
-        if (!shouldSend("permission")) return;
-        traceEvent("toast: permission -> sending");
-        await sendToast(`opencode · 需要授权 [${workspace}]`, "agent 正在等待你的权限确认", "urgent");
-        return;
+  const controller = new AbortController();
+  void (async () => {
+    for await (const raw of ctx.event.subscribe({ signal: controller.signal })) {
+      try {
+        await handleEvent(raw as unknown as NotifyEvent);
+      } catch (cause) {
+        // One bad event must never kill the subscription.
+        traceEvent(`handler error: ${cause instanceof Error ? cause.message : cause}`);
       }
+    }
+  })();
 
-      // The agent asked the user a question (the `question` tool). This is the
-      // "needs a decision" case and must reach the user reliably.
-      if (type === "question.asked") {
-        if (!shouldSend("question")) return;
-        traceEvent("toast: question -> sending");
-        await sendToast(`opencode · 需要你回答 [${workspace}]`, "agent 提了一个问题，等待你的决定", "urgent");
-        return;
-      }
+  return () => controller.abort();
+}
 
-      if (type === "session.error") {
-        // An ESC interrupt arrives as session.error with name
-        // "MessageAbortedError". That is a deliberate user action, not a
-        // failure, so it must not raise an "error" notification.
-        const errName = (event as { properties?: { error?: { name?: string } } }).properties?.error?.name;
-        if (errName === "MessageAbortedError") {
-          traceEvent("toast: skipped (user aborted)");
-          return;
-        }
-        if (!shouldSend("error")) return;
-        traceEvent(`toast: error -> sending (${errName ?? "unknown"})`);
-        await sendToast(`opencode · 出错 [${workspace}]`, "会话发生错误，请检查", "urgent");
-        return;
-      }
-    },
-  };
-};
+export default { id: "notify-windows", setup };

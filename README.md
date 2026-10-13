@@ -23,13 +23,13 @@ opencode 内置的 `attention` 只发 **OSC 9 / OSC 777 终端转义序列**，�
 |---|---|---|
 | Windows | 10 / 11 | WinRT Toast API 仅 Windows 提供 |
 | Windows PowerShell | `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` | **必须是 5.1**，见下 |
-| opencode | 任意近期版本 | 插件宿主 |
+| opencode | 2.x（V2 插件 API） | 插件宿主 |
 
 > **为什么必须是 PowerShell 5.1？** PS 7 是基于 .NET Core 的跨平台版本，**不暴露 WinRT 的 `Windows.UI.Notifications` API**。这是硬约束，不是偏好。脚本里写死了 5.1 的绝对路径。
 
 ### 可选
 
-无。不依赖外部 npm 包（`@opencode-ai/plugin` 仅用于类型检查，运行时由 opencode 提供）。
+无。不依赖外部 npm 包（`@opencode/plugin` 仅用于类型检查，运行时由 opencode 提供）。
 
 ### 平台限制
 
@@ -61,8 +61,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 |---|---|
 | 会话空闲（`session.idle`，或 `session.status` 且 `status.type === "idle"`） | `opencode · 完成 [工作区路径]` |
 | 权限请求（`permission.asked`） | `opencode · 需要授权 [工作区路径]` |
-| agent 提问（`question.asked`） | `opencode · 需要你回答 [工作区路径]` |
-| 会话出错（`session.error`） | `opencode · 出错 [工作区路径]` |
+| agent 提问（`question` 工具，事件为 `form.created`） | `opencode · 需要你回答 [工作区路径]` |
+| 会话出错（`session.execution.failed`） | `opencode · 出错 [工作区路径]` |
 
 > **标题带完整工作区路径**（主目录缩写为 `~`）。两个 opencode 开在不同项目时，
 > 一眼看出是哪条。早期只显示目录名，同名目录无法区分。
@@ -96,8 +96,9 @@ Toast 用**异步 spawn 并 await 退出**发送（不 detached），且**串行
 
 ### ESC 打断
 
-ESC 中断会发 `session.error`，但 `error.name === "MessageAbortedError"`。
-这是用户主动打断，不是故障，插件会跳过，不报"出错"。
+ESC 中断在 V2 里报 `session.execution.interrupted`（`reason: "user"`），不产生错误通知。
+若某条中断仍以 `session.execution.failed` 出现，其 `error.type === "MessageAbortedError"`，
+同样会被跳过。这两种都是用户主动打断，不是故障，插件不会报"出错"。
 
 ### 点击跳转（部分可用）
 

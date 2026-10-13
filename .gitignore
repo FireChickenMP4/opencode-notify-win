@@ -7,3 +7,7 @@ package-lock.json
 Thumbs.db
 .vscode/
 .idea/
+
+# runtime state
+notify-windows.events.log
+notify-windows.undelivered.log
