@@ -157,6 +157,10 @@ notify-windows toggle    # 翻转
 
 默认 `urgent`：够用且不吵。若你的勿扰是「仅闹钟」，改 `OPENCODE_NOTIFY_SCENARIO=alarm`。
 
+> **本机实测（专注助手 = 「仅优先」）**：只有 `urgent` 真的弹出横幅。`default` 与 `reminder`
+> 都没有红色感叹号，但也**只进了通知中心、没弹出来**，所以默认保持 `urgent` ——
+> 红色感叹号就是穿透专注助手的代价。
+
 ### 延迟
 
 一次通知（弹窗 + 闪烁）约 **600ms**。构成：
