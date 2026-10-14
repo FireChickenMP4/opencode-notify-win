@@ -9,7 +9,8 @@
 param(
     [string]$AppId = "FireChickenMP4.opencode.workflow",
     [string]$DisplayName = "opencode",
-    [switch]$SkipAttentionConfig
+    [switch]$SkipAttentionConfig,
+    [switch]$SkipShellFunction
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,6 +50,9 @@ foreach ($s in $scripts) {
 # The app icon shown on the toast; not a .ps1, so it must not get a BOM.
 Copy-Item (Join-Path $src "notify\opencode.ico") (Join-Path $notifyDir "opencode.ico") -Force
 
+# Shell switch: `notify-windows on|off|status|toggle` (ASCII only, so no BOM).
+Copy-Item (Join-Path $src "notify-windows.ps1") (Join-Path $notifyDir "notify-windows.ps1") -Force
+
 # Ensure each .ps1 keeps its UTF-8 BOM; PS 5.1 reads BOM-less files as ANSI
 # and would mangle every non-ASCII literal.
 foreach ($s in $scripts) {
@@ -87,6 +91,51 @@ if (-not $SkipAttentionConfig) {
     $json = $config | ConvertTo-Json -Depth 8
     [System.IO.File]::WriteAllText($cliJson, $json, (New-Object System.Text.UTF8Encoding($false)))
     Write-Output "disabled built-in attention in $cliJson"
+}
+
+# Shell function so `notify-windows on|off|status|toggle` works in any terminal.
+#
+# Written into BOTH the Windows PowerShell 5.1 and PowerShell 7 profiles: the
+# installer may run under either, but the user's interactive shell is usually
+# pwsh 7, so installing only into the caller's profile would silently miss it.
+if (-not $SkipShellFunction) {
+    $cliScript = Join-Path $notifyDir "notify-windows.ps1"
+    $begin = "# >>> opencode-notify-windows >>>"
+    $end = "# <<< opencode-notify-windows <<<"
+    $block = @"
+$begin
+function notify-windows {
+    param([Parameter(Position = 0)][string]`$Action = 'status')
+    & "$cliScript" `$Action
+}
+$end
+"@
+
+    $docs = [Environment]::GetFolderPath("MyDocuments")
+    $profiles = @(
+        (Join-Path $docs "WindowsPowerShell\profile.ps1"),  # PS 5.1
+        (Join-Path $docs "PowerShell\profile.ps1")          # pwsh 7
+    )
+
+    foreach ($profilePath in $profiles) {
+        $profileDir = Split-Path $profilePath -Parent
+        if (-not (Test-Path $profileDir)) { New-Item -ItemType Directory -Force -Path $profileDir | Out-Null }
+        if (-not (Test-Path $profilePath)) { New-Item -ItemType File -Force -Path $profilePath | Out-Null }
+
+        $existing = Get-Content $profilePath -Raw -ErrorAction SilentlyContinue
+        if ($null -eq $existing) { $existing = "" }
+
+        $pattern = "(?s)" + [regex]::Escape($begin) + ".*?" + [regex]::Escape($end)
+        if ($existing -match $pattern) {
+            $updated = [regex]::Replace($existing, $pattern, $block)
+        } else {
+            $sep = if ($existing.TrimEnd().Length -gt 0) { "`r`n`r`n" } else { "" }
+            $updated = $existing.TrimEnd() + $sep + $block + "`r`n"
+        }
+        [System.IO.File]::WriteAllText($profilePath, $updated, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Output "shell function installed in: $profilePath"
+    }
+    Write-Output "  (open a new terminal, then: notify-windows status|on|off|toggle)"
 }
 
 Write-Output ""

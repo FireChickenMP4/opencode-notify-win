@@ -6,7 +6,7 @@
  * real Windows toast via Windows PowerShell 5.1 + WinRT instead.
  *
  * Env overrides:
- *   OPENCODE_NOTIFY=0            disable entirely
+ *   OPENCODE_NOTIFY=0            hard kill switch (needs a service restart)
  *   OPENCODE_NOTIFY_SCENARIO     default | urgent | alarm | reminder
  *   OPENCODE_NOTIFY_SOUND=0      no sound
  *   OPENCODE_NOTIFY_ON_IDLE=0    skip the completion notice (notify only on question/permission/error)
@@ -19,6 +19,9 @@
  *                                auto-accept mode only: how long to wait before deciding a
  *                                permission request really is waiting (default 1500). With
  *                                manual approval the toast goes out at once.
+ *
+ * Runtime switch: ~/.config/opencode/notify-windows.json `{ "enabled": false }`
+ * turns toasts off (and back on) without a restart - see `notify-windows on|off`.
  */
 
 import { spawn } from "node:child_process";
@@ -71,7 +74,8 @@ const SCRIPT_CANDIDATES = [join(HERE, "notify", "notify.ps1"), join(HERE, "notif
 // PowerShell 5.1 is required: PowerShell 7 does not expose the WinRT toast API.
 const PS = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 
-const enabled = process.env.OPENCODE_NOTIFY !== "0";
+/** Env kill switch; the JSON switch below is the runtime one. */
+const envEnabled = process.env.OPENCODE_NOTIFY !== "0";
 const scenario = process.env.OPENCODE_NOTIFY_SCENARIO ?? "urgent";
 const sound = process.env.OPENCODE_NOTIFY_SOUND !== "0";
 const notifyOnIdle = process.env.OPENCODE_NOTIFY_ON_IDLE !== "0";
@@ -82,6 +86,29 @@ const clickToActivate = process.env.OPENCODE_NOTIFY_CLICK_ACTIVATE === "1";
 const flashWindow = process.env.OPENCODE_NOTIFY_FLASH !== "0";
 
 const SCRIPT = SCRIPT_CANDIDATES.find((p) => existsSync(p)) ?? SCRIPT_CANDIDATES[0]!;
+
+/** Path of the runtime on/off switch; an absent file means "on". */
+function switchPath(): string {
+  const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+  return join(base, "opencode", "notify-windows.json");
+}
+
+/**
+ * Whether a toast may be sent right now.
+ *
+ * Read fresh on every send, so `notify-windows off` takes effect without a
+ * restart. The plugin still subscribes while off: otherwise turning it back on
+ * would need a reload.
+ */
+function enabledNow(): boolean {
+  if (!envEnabled) return false;
+  try {
+    const cfg = JSON.parse(readFileSync(switchPath(), "utf8")) as { enabled?: unknown };
+    return cfg.enabled !== false;
+  } catch {
+    return true;
+  }
+}
 
 /** Event types the plugin acts on; only these go into the diagnostics log. */
 const TRACED_EVENTS = new Set([
@@ -196,7 +223,7 @@ function sendToast(title: string, message: string, overrideScenario?: string): P
 }
 
 async function attemptToast(title: string, message: string, overrideScenario?: string): Promise<void> {
-  if (!enabled || process.platform !== "win32") return;
+  if (!enabledNow() || process.platform !== "win32") return;
   for (let i = 1; i <= 2; i++) {
     const code = await runPowerShellToast(title, message, overrideScenario, i);
     if (code === 0) return;
@@ -264,7 +291,7 @@ function runPowerShellToast(
 
 /** V2 plugin entrypoint. Returns a cleanup that stops the event subscription. */
 async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
-  if (!enabled || process.platform !== "win32") {
+  if (process.platform !== "win32") {
     return;
   }
   if (!existsSync(SCRIPT)) {
@@ -275,7 +302,8 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
   }
 
   console.log(
-    `[notify-windows] Windows toast notifications enabled (scenario=${scenario}, sound=${sound}, onIdle=${notifyOnIdle})`,
+    `[notify-windows] toasts ${enabledNow() ? "enabled" : "disabled (notify-windows.json)"} ` +
+      `(scenario=${scenario}, sound=${sound}, onIdle=${notifyOnIdle})`,
   );
 
   /**

@@ -118,11 +118,22 @@ ESC 中断在 V2 里报 `session.execution.interrupted`（`reason: "user"`），
 
 ## 配置
 
+### 开关
+
+```powershell
+notify-windows           # 看状态
+notify-windows on / off  # 开关（立即生效，不用重启）
+notify-windows toggle    # 翻转
+```
+
+开关就是 `~/.config/opencode/notify-windows.json` 里的 `{ "enabled": false }`；文件不存在视为开。
+插件在每次要弹之前重读它，所以改完立刻生效，也不用重开 opencode。
+
 环境变量：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `OPENCODE_NOTIFY` | `1` | 设 `0` 完全关闭 |
+| `OPENCODE_NOTIFY` | `1` | 设 `0` 完全关闭（**硬开关**，模块加载时读，需要重启服务才生效） |
 | `OPENCODE_NOTIFY_SCENARIO` | `urgent` | `default` / `urgent` / `alarm` / `reminder` |
 | `OPENCODE_NOTIFY_SOUND` | `1` | 设 `0` 静音 |
 | `OPENCODE_NOTIFY_ON_IDLE` | `1` | 设 `0` 不通知回合完成（只在需授权/提问/出错时通知） |
@@ -202,6 +213,7 @@ Remove-Item "HKCU:\SOFTWARE\Classes\opencode-notify" -Recurse -Force
 ```text
 src/
   notify-windows.ts      # opencode plugin（挂 session 事件）
+  notify-windows.ps1     # 开关 CLI（on/off/status/toggle）
   notify/
     notify.ps1           # 发送器（弹窗 + 闪烁，环境变量传参，UTF-8 BOM）
     flash-window.ps1     # 任务栏闪烁（FlashWindowEx）
