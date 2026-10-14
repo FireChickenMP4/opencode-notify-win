@@ -59,7 +59,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 | 事件 | 通知 |
 |---|---|
-| 会话空闲（`session.idle`，或 `session.status` 且 `status.type === "idle"`） | `opencode · 完成 [工作区路径]` |
+| 回合结束（`session.step.ended` 且 `finish` 不是 `tool-calls`） | `opencode · 完成 [工作区路径]` |
 | 权限请求（`permission.asked`，且宽限期内仍无人处理） | `opencode · 需要授权 [工作区路径]` |
 | agent 提问（`question` 工具，事件为 `form.created`） | `opencode · 需要你回答 [工作区路径]` |
 | 会话出错（`session.execution.failed`） | `opencode · 出错 [工作区路径]` |
@@ -79,9 +79,11 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 > `session.idle`，ESC 打断时甚至一秒内数条）。同类通知在 `OPENCODE_NOTIFY_DEDUP_MS`
 > （默认 3000ms）内只发一次，避免刷屏。
 
-> **注意**：空闲信号可能来自 `session.status`（携带 `status.type === "idle"`）
-> **或**独立的 `session.idle` 事件——实测后者才是主要来源。两条路径都要做
-> 子代理判断，否则子代理结束会被误报成"任务完成"。
+> **注意**：V2 的公开事件流里**没有** `session.idle` / `session.status`（实测 15 分钟
+> 数百条事件里 0 次），所以「回合结束」取的是 `session.step.ended` 的 `finish`：
+> `tool-calls` 表示模型还要继续（回合未结束），其余值（`stop` 等）表示这一轮收尾。
+> step 之间会有一条 `finish: "tool-calls"`，只有收尾那一条才会通知。
+> 子代理的收尾同样要判断，否则子代理结束会被误报成"任务完成"。
 
 ### 发送方式
 
@@ -123,7 +125,7 @@ ESC 中断在 V2 里报 `session.execution.interrupted`（`reason: "user"`），
 | `OPENCODE_NOTIFY` | `1` | 设 `0` 完全关闭 |
 | `OPENCODE_NOTIFY_SCENARIO` | `urgent` | `default` / `urgent` / `alarm` / `reminder` |
 | `OPENCODE_NOTIFY_SOUND` | `1` | 设 `0` 静音 |
-| `OPENCODE_NOTIFY_ON_IDLE` | `1` | 设 `0` 只在需授权/出错时通知 |
+| `OPENCODE_NOTIFY_ON_IDLE` | `1` | 设 `0` 不通知回合完成（只在需授权/提问/出错时通知） |
 | `OPENCODE_NOTIFY_FLASH` | `1` | 设 `0` 关闭任务栏闪烁 |
 | `OPENCODE_NOTIFY_SUBAGENT` | `0` | 设 `1` 也通知子代理结束 |
 | `OPENCODE_NOTIFY_LOG` | `1` | 设 `0` 关闭诊断事件日志 |

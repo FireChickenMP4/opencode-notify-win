@@ -9,7 +9,7 @@
  *   OPENCODE_NOTIFY=0            disable entirely
  *   OPENCODE_NOTIFY_SCENARIO     default | urgent | alarm | reminder
  *   OPENCODE_NOTIFY_SOUND=0      no sound
- *   OPENCODE_NOTIFY_ON_IDLE=0    skip "session idle" (notify only on question/permission/error)
+ *   OPENCODE_NOTIFY_ON_IDLE=0    skip the completion notice (notify only on question/permission/error)
  *   OPENCODE_NOTIFY_SUBAGENT=1   also notify when a subagent finishes (default off)
  *   OPENCODE_NOTIFY_LOG=0        disable the diagnostics event log
  *   OPENCODE_NOTIFY_LOG_MAX      rotate the diagnostics log past this many bytes
@@ -85,8 +85,6 @@ const SCRIPT = SCRIPT_CANDIDATES.find((p) => existsSync(p)) ?? SCRIPT_CANDIDATES
 
 /** Event types the plugin acts on; only these go into the diagnostics log. */
 const TRACED_EVENTS = new Set([
-  "session.status",
-  "session.idle",
   "permission.asked",
   "form.created",
   "session.execution.failed",
@@ -104,6 +102,8 @@ type NotifyEvent = {
     id?: string;
     sessionID?: string;
     status?: { type?: string };
+    /** Why a step ended; anything but "tool-calls" means the turn is over. */
+    finish?: string;
     error?: { type?: string; message?: string };
   };
 };
@@ -333,7 +333,7 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
   }
 
   /** A finished turn is reported once; a subagent's finish is not the main turn ending. */
-  async function notifyIdle(event: NotifyEvent, sessionID: string | undefined): Promise<void> {
+  async function notifyDone(event: NotifyEvent, sessionID: string | undefined): Promise<void> {
     if (!notifyOnIdle) return;
 
     const info = sessionID ? await sessionInfo(sessionID) : {};
@@ -350,7 +350,7 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
     }
 
     if (!shouldSend("idle")) return;
-    traceEvent("toast: idle -> sending");
+    traceEvent("toast: done -> sending");
     await sendToast(`opencode · 完成 [${workspaceOf(event, info.directory)}]`, "agent 已结束，可以查看了");
   }
 
@@ -391,17 +391,12 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
     // the full event dump is available behind OPENCODE_NOTIFY_DEBUG=1.
     if (TRACED_EVENTS.has(type)) traceEvent(`event:${type}`);
 
-    // Both session.status/idle and the standalone session.idle carry the
-    // sessionID; whichever fires, the subagent check must run so a subagent
-    // finishing is not reported as the main turn ending.
-    if (type === "session.status") {
-      if (event.data?.status?.type !== "idle") return;
-      await notifyIdle(event, event.data?.sessionID);
-      return;
-    }
-
-    if (type === "session.idle") {
-      await notifyIdle(event, event.data?.sessionID);
+    // V2 has no session.idle or session.status event on the public stream, so
+    // the turn boundary is the step that ends without wanting a tool call:
+    // `finish: "tool-calls"` means the turn continues.
+    if (type === "session.step.ended") {
+      if (event.data?.finish === "tool-calls") return;
+      await notifyDone(event, event.data?.sessionID);
       return;
     }
 
