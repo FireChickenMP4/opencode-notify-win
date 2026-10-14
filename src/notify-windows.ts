@@ -329,7 +329,7 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
   /** Subagent activity is frequent; only notify about it on request. */
   const notifySubagent = process.env.OPENCODE_NOTIFY_SUBAGENT === "1";
 
-  type SessionInfo = { parentID?: string; title?: string; directory?: string };
+  type SessionInfo = { parentID?: string; title?: string; directory?: string; metadata?: { aside?: boolean } };
   const sessionCache = new Map<string, SessionInfo>();
 
   /**
@@ -345,7 +345,12 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
     try {
       // V2 returns the session record directly, not a `{ data }` envelope.
       const data = await ctx.session.get({ sessionID });
-      const info: SessionInfo = { parentID: data.parentID, title: data.title, directory: data.location?.directory };
+      const info: SessionInfo = {
+        parentID: data.parentID,
+        title: data.title,
+        directory: data.location?.directory,
+        metadata: data.metadata,
+      };
       sessionCache.set(sessionID, info);
       return info;
     } catch {
@@ -365,7 +370,12 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
     if (!notifyOnIdle) return;
 
     const info = sessionID ? await sessionInfo(sessionID) : {};
-    if (info.parentID) {
+    // A `.bt` aside fork: the QQ bridge relays its answer itself.
+    if (isAside(info)) {
+      traceEvent(`idle skipped: aside fork (${shortTitle(info.title)})`);
+      return;
+    }
+    if (isSubagent(info)) {
       // A subagent finished; the main session is still working.
       if (!notifySubagent) {
         traceEvent(`idle skipped: subagent (${shortTitle(info.title)})`);
@@ -479,6 +489,26 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
   })();
 
   return () => controller.abort();
+}
+
+/**
+ * Sessions whose completion stays unreported.
+ *
+ * A subagent (parentID) finishes while the main session is still working. A
+ * `.bt` aside fork carries no parentID, so the subagent rule alone misses it -
+ * the QQ bridge marks its forks with this metadata, and the title is a fallback
+ * for one that outlived a bridge restart.
+ *
+ * Pure on purpose: the decision can be tested without the toast side effects.
+ */
+export type QuietSession = { parentID?: string; title?: string; metadata?: { aside?: boolean } };
+
+export function isSubagent(session: QuietSession): boolean {
+  return Boolean(session.parentID);
+}
+
+export function isAside(session: QuietSession): boolean {
+  return session.metadata?.aside === true || Boolean(session.title?.startsWith("旁问 ·"));
 }
 
 export default { id: "notify-windows", setup };
