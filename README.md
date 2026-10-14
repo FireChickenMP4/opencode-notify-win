@@ -129,7 +129,7 @@ ESC 中断在 V2 里报 `session.execution.interrupted`（`reason: "user"`），
 | `OPENCODE_NOTIFY_LOG` | `1` | 设 `0` 关闭诊断事件日志 |
 | `OPENCODE_NOTIFY_LOG_MAX` | `5242880` | 诊断日志超过此字节数即轮转到 `.1` |
 | `OPENCODE_NOTIFY_DEDUP_MS` | `3000` | 同类通知在此毫秒数内只发一次 |
-| `OPENCODE_NOTIFY_PERMISSION_GRACE_MS` | `1500` | 权限请求等待超过此时长仍无人处理才通知（自动批准的不会通知） |
+| `OPENCODE_NOTIFY_PERMISSION_GRACE_MS` | `1500` | 仅在 `cli.json` 设为 `autoaccept` 时生效：等此时长确认权限是否已被自动批准；手动审批时立即通知 |
 | `OPENCODE_NOTIFY_CLICK_ACTIVATE` | `0` | 设 `1` 尝试点击跳转（见上） |
 | `OPENCODE_NOTIFY_APPID` | 安装时的 AUMID | 发送者身份 |
 

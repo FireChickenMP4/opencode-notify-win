@@ -16,13 +16,14 @@
  *   OPENCODE_NOTIFY_APPID        AUMID to send as
  *   OPENCODE_NOTIFY_DEDUP_MS     suppress a repeated notification of the same kind (default 3000)
  *   OPENCODE_NOTIFY_PERMISSION_GRACE_MS
- *                                how long a permission must stay unanswered before notifying
- *                                (auto-accepted requests are answered sooner; default 1500)
+ *                                auto-accept mode only: how long to wait before deciding a
+ *                                permission request really is waiting (default 1500). With
+ *                                manual approval the toast goes out at once.
  */
 
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "@opencode/plugin";
@@ -97,6 +98,8 @@ const TRACED_EVENTS = new Set([
  */
 type NotifyEvent = {
   type: string;
+  /** The location the event was published for; the session's own directory. */
+  location?: { directory?: string };
   data?: {
     id?: string;
     sessionID?: string;
@@ -104,6 +107,33 @@ type NotifyEvent = {
     error?: { type?: string; message?: string };
   };
 };
+
+/**
+ * Path of the CLI settings file, where automatic approval of permission
+ * requests is configured.
+ */
+function cliConfigPath(): string {
+  const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+  return join(base, "opencode", "cli.json");
+}
+
+/**
+ * True when the CLI answers permission requests on its own.
+ *
+ * Only then can a request be resolved before a human ever sees it, which is the
+ * one case where "需要授权" would be noise. Read fresh, so flipping the setting
+ * takes effect without a restart.
+ */
+function autoAcceptEnabled(): boolean {
+  try {
+    const cfg = JSON.parse(readFileSync(cliConfigPath(), "utf8")) as { session?: { permissions?: unknown } };
+    const mode = cfg.session?.permissions;
+    return typeof mode === "string" && mode.toLowerCase().replace(/[-_]/g, "") === "autoaccept";
+  } catch {
+    // Unreadable settings: assume requests are answered by hand, so notify at once.
+    return false;
+  }
+}
 
 /**
  * De-duplicate notifications of the same kind within a short window.
@@ -255,21 +285,23 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
    * projects with the same folder name (or the same project opened twice) were
    * indistinguishable in a notification. The full path (with a ~ shorthand for
    * the home dir) tells you which one fired.
+   *
+   * The directory comes from the event (or the session), never from this plugin
+   * instance: opencode loads a local plugin once per location, so the instance's
+   * own directory belongs to whichever location loaded it, not to the session
+   * that fired the event.
    */
-  const workspace = (() => {
-    const dir = ctx.location.directory || process.cwd();
+  function workspaceOf(event: NotifyEvent, fallback?: string): string {
+    const dir = event.location?.directory ?? fallback ?? ctx.location.directory ?? process.cwd();
     const home = process.env.USERPROFILE || process.env.HOME || "";
     const short = home && dir.toLowerCase().startsWith(home.toLowerCase()) ? `~${dir.slice(home.length)}` : dir;
     return short.replace(/\\/g, "/");
-  })();
-
-  /** Last path segment, used where a short label reads better. */
-  const workspaceName = workspace.split("/").filter(Boolean).pop() ?? "opencode";
+  }
 
   /** Subagent activity is frequent; only notify about it on request. */
   const notifySubagent = process.env.OPENCODE_NOTIFY_SUBAGENT === "1";
 
-  type SessionInfo = { parentID?: string; title?: string };
+  type SessionInfo = { parentID?: string; title?: string; directory?: string };
   const sessionCache = new Map<string, SessionInfo>();
 
   /**
@@ -285,7 +317,7 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
     try {
       // V2 returns the session record directly, not a `{ data }` envelope.
       const data = await ctx.session.get({ sessionID });
-      const info: SessionInfo = { parentID: data.parentID, title: data.title };
+      const info: SessionInfo = { parentID: data.parentID, title: data.title, directory: data.location?.directory };
       sessionCache.set(sessionID, info);
       return info;
     } catch {
@@ -301,7 +333,7 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
   }
 
   /** A finished turn is reported once; a subagent's finish is not the main turn ending. */
-  async function notifyIdle(sessionID: string | undefined): Promise<void> {
+  async function notifyIdle(event: NotifyEvent, sessionID: string | undefined): Promise<void> {
     if (!notifyOnIdle) return;
 
     const info = sessionID ? await sessionInfo(sessionID) : {};
@@ -319,20 +351,22 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
 
     if (!shouldSend("idle")) return;
     traceEvent("toast: idle -> sending");
-    await sendToast(`opencode · 完成 [${workspace}]`, "agent 已结束，可以查看了");
+    await sendToast(`opencode · 完成 [${workspaceOf(event, info.directory)}]`, "agent 已结束，可以查看了");
   }
 
   /**
    * True when a permission request is still unanswered after a short grace.
    *
-   * opencode can accept a request automatically, which resolves it almost
-   * immediately; a notification for that is pure noise. Fails open: a lookup
-   * error counts as "still waiting", so a real notice is never lost.
+   * Only auto-accept can resolve a request before a human sees it, so with
+   * manual approval there is nothing to wait for and the toast goes out at
+   * once. Fails open: a lookup error counts as "still waiting", so a real
+   * notice is never lost.
    */
   async function stillWaiting(data: NotifyEvent["data"]): Promise<boolean> {
     const sessionID = data?.sessionID;
     const requestID = data?.id;
     if (!sessionID || !requestID) return true;
+    if (!autoAcceptEnabled()) return true;
     await new Promise((r) => setTimeout(r, PERMISSION_GRACE_MS));
     try {
       const pending = await ctx.permission.list({ sessionID });
@@ -362,12 +396,12 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
     // finishing is not reported as the main turn ending.
     if (type === "session.status") {
       if (event.data?.status?.type !== "idle") return;
-      await notifyIdle(event.data?.sessionID);
+      await notifyIdle(event, event.data?.sessionID);
       return;
     }
 
     if (type === "session.idle") {
-      await notifyIdle(event.data?.sessionID);
+      await notifyIdle(event, event.data?.sessionID);
       return;
     }
 
@@ -380,7 +414,7 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
       }
       if (!shouldSend("permission")) return;
       traceEvent("toast: permission -> sending");
-      await sendToast(`opencode · 需要授权 [${workspace}]`, "agent 正在等待你的权限确认", "urgent");
+      await sendToast(`opencode · 需要授权 [${workspaceOf(event)}]`, "agent 正在等待你的权限确认", "urgent");
       return;
     }
 
@@ -390,7 +424,7 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
     if (type === "form.created") {
       if (!shouldSend("question")) return;
       traceEvent("toast: question -> sending");
-      await sendToast(`opencode · 需要你回答 [${workspace}]`, "agent 提了一个问题，等待你的决定", "urgent");
+      await sendToast(`opencode · 需要你回答 [${workspaceOf(event)}]`, "agent 提了一个问题，等待你的决定", "urgent");
       return;
     }
 
@@ -404,7 +438,7 @@ async function setup(ctx: Plugin.Context): Promise<(() => void) | undefined> {
       }
       if (!shouldSend("error")) return;
       traceEvent(`toast: error -> sending (${event.data?.error?.type ?? "unknown"})`);
-      await sendToast(`opencode · 出错 [${workspace}]`, "会话发生错误，请检查", "urgent");
+      await sendToast(`opencode · 出错 [${workspaceOf(event)}]`, "会话发生错误，请检查", "urgent");
       return;
     }
   }
