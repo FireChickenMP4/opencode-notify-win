@@ -8,6 +8,7 @@
 
 param(
     [string]$AppId = "FireChickenMP4.opencode.workflow",
+    [string]$DisplayName = "opencode",
     [switch]$SkipAttentionConfig
 )
 
@@ -45,6 +46,9 @@ foreach ($s in $scripts) {
     Copy-Item (Join-Path $src "notify\$s") (Join-Path $notifyDir $s) -Force
 }
 
+# The app icon shown on the toast; not a .ps1, so it must not get a BOM.
+Copy-Item (Join-Path $src "notify\opencode.ico") (Join-Path $notifyDir "opencode.ico") -Force
+
 # Ensure each .ps1 keeps its UTF-8 BOM; PS 5.1 reads BOM-less files as ANSI
 # and would mangle every non-ASCII literal.
 foreach ($s in $scripts) {
@@ -58,7 +62,13 @@ foreach ($s in $scripts) {
 }
 
 # Register the AUMID so CreateToastNotifier accepts our appId.
-& (Join-Path $src "register-aumid.ps1") -AppId $AppId
+# The previous shortcut name would otherwise linger as a stale app identity.
+$legacy = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\opencode workflow.lnk"
+if (Test-Path $legacy) {
+    Remove-Item $legacy -Force
+    Write-Output "removed legacy shortcut: $legacy"
+}
+& (Join-Path $src "register-aumid.ps1") -AppId $AppId -DisplayName $DisplayName -IconPath (Join-Path $notifyDir "opencode.ico")
 
 # Register the opencode-notify:// protocol used by click-to-activate.
 & (Join-Path $notifyDir "register-protocol.ps1")

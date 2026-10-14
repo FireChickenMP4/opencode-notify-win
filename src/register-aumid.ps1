@@ -5,11 +5,15 @@
 #   1. a Start Menu shortcut (gives the app an identity)
 #   2. PKEY_AppUserModel_ID written onto that shortcut via IPropertyStore
 #
+# The shortcut's file name is what Windows shows as the app name on the toast,
+# and its icon is what the toast and the notification settings show.
+#
 # Idempotent: safe to run repeatedly.
 
 param(
     [string]$AppId = "FireChickenMP4.opencode.workflow",
-    [string]$DisplayName = "opencode workflow"
+    [string]$DisplayName = "opencode",
+    [string]$IconPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,6 +27,10 @@ $shell = New-Object -ComObject WScript.Shell
 $lnk = $shell.CreateShortcut($lnkPath)
 $lnk.TargetPath = $ps
 $lnk.Arguments = "-NoProfile"
+if ($IconPath -and (Test-Path $IconPath)) {
+    # A PNG is not accepted here; the bundled .ico carries 16/32/48 px frames.
+    $lnk.IconLocation = "$IconPath,0"
+}
 $lnk.Save()
 
 # 2. AUMID via IPropertyStore (PKEY_AppUserModel_ID)
